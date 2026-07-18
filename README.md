@@ -46,7 +46,7 @@ Startup, battery limit and logging were moved from the tray into **Settings > Ge
 
 ### Controller
 
-The Controller tab includes a stylized front/rear Legion Go diagram and edits:
+The Controller tab includes embedded front/rear Legion Go product-reference diagrams with numbered callouts. It automatically switches view according to the selected button and edits:
 
 ```text
 Menu, View, Y1, Y2, Y3, M2, M3
@@ -210,7 +210,7 @@ LegionGoNativeWmiProbe.exe
 build\LegionGoCoreTests.exe
 ```
 
-The build uses C++17, `/W4`, `/O2`, x64 Release and embeds the Per-Monitor DPI-aware manifest.
+The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release, embeds the controller bitmap resources and includes the Per-Monitor DPI-aware manifest. Image source references are recorded in `assets/README.md`.
 
 ## Non-hardware tests
 

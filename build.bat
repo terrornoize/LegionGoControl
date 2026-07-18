@@ -7,10 +7,12 @@ call :setup_x64 || exit /b 1
 set "BUILD_DIR=%CD%\build"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%" || exit /b 1
 
-set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /O2 /DNDEBUG /DUNICODE /D_UNICODE"
+set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DNDEBUG /DUNICODE /D_UNICODE"
 
 echo [1/3] Building LegionGoControl.exe (x64 Release)...
-cl %CXXFLAGS% LegionGoControl.cpp LegionGoCore.cpp /Fo"%BUILD_DIR%\\" /Fe"%CD%\LegionGoControl.exe" /link /MACHINE:X64 /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:"%CD%\app.manifest"
+rc /nologo /fo "%BUILD_DIR%\LegionGoControl.res" "%CD%\LegionGoControl.rc"
+if errorlevel 1 exit /b 1
+cl %CXXFLAGS% LegionGoControl.cpp LegionGoCore.cpp "%BUILD_DIR%\LegionGoControl.res" /Fo"%BUILD_DIR%\\" /Fe"%CD%\LegionGoControl.exe" /link /MACHINE:X64 /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:"%CD%\app.manifest"
 if errorlevel 1 exit /b 1
 
 echo [2/3] Building LegionGoNativeWmiProbe.exe (x64 Release)...

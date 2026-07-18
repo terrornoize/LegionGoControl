@@ -16,6 +16,7 @@
 #include <objbase.h>
 
 #include "LegionGoCore.h"
+#include "resource.h"
 
 #include <algorithm>
 #include <atomic>
@@ -110,6 +111,8 @@ HWND g_profilesWindow = nullptr;
 NOTIFYICONDATAW g_nid{};
 HICON g_icon = nullptr;
 HFONT g_font = nullptr;
+HBITMAP g_frontBitmap = nullptr;
+HBITMAP g_rearBitmap = nullptr;
 HANDLE g_singleton = nullptr;
 UINT g_taskbarCreated = 0;
 
@@ -942,41 +945,54 @@ bool ApplySettings(HWND hwnd) {
     LoadConfiguration(); QueueWorker(WorkerJob::Wake); Balloon(L"Settings applied."); return true;
 }
 
+bool DrawBitmapFit(HDC destination, HBITMAP bitmap, const RECT& bounds) {
+    if (!bitmap) return false;
+    BITMAP information{};
+    if (!GetObjectW(bitmap, sizeof(information), &information) || information.bmWidth <= 0 || information.bmHeight <= 0) return false;
+    const int availableWidth = bounds.right - bounds.left, availableHeight = bounds.bottom - bounds.top;
+    int width = availableWidth;
+    int height = MulDiv(width, information.bmHeight, information.bmWidth);
+    if (height > availableHeight) { height = availableHeight; width = MulDiv(height, information.bmWidth, information.bmHeight); }
+    const int x = bounds.left + (availableWidth - width) / 2;
+    const int y = bounds.top + (availableHeight - height) / 2;
+    HDC source = CreateCompatibleDC(destination);
+    if (!source) return false;
+    HGDIOBJ previous = SelectObject(source, bitmap);
+    SetStretchBltMode(destination, HALFTONE); SetBrushOrgEx(destination, 0, 0, nullptr);
+    const BOOL drawn = StretchBlt(destination, x, y, width, height, source, 0, 0,
+                                  information.bmWidth, information.bmHeight, SRCCOPY);
+    SelectObject(source, previous); DeleteDC(source); return drawn == TRUE;
+}
+
 LRESULT CALLBACK DiagramProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_ERASEBKGND) return 1;
     if (message == WM_PAINT) {
         PAINTSTRUCT paint{}; HDC dc = BeginPaint(hwnd, &paint); RECT client{}; GetClientRect(hwnd, &client);
-        HBRUSH background = CreateSolidBrush(RGB(247, 249, 252)); FillRect(dc, &client, background); DeleteObject(background);
+        HBRUSH background = CreateSolidBrush(RGB(10, 11, 17)); FillRect(dc, &client, background); DeleteObject(background);
         SetMapMode(dc, MM_ANISOTROPIC); SetWindowExtEx(dc, 350, 292, nullptr);
         SetViewportExtEx(dc, (std::max)(1L, client.right - client.left), (std::max)(1L, client.bottom - client.top), nullptr);
         SetBkMode(dc, TRANSPARENT); SelectObject(dc, g_font);
         HWND settings = GetParent(hwnd); SettingsState* state = SettingsData(settings);
         const std::wstring selected = state && !state->buttons.empty() ? state->buttons[static_cast<std::size_t>(state->selectedButton)].name : L"";
-        HPEN pen = CreatePen(PS_SOLID, 2, RGB(55, 65, 81)); HGDIOBJ oldPen = SelectObject(dc, pen);
-        HBRUSH body = CreateSolidBrush(RGB(222, 228, 236)); HGDIOBJ oldBrush = SelectObject(dc, body);
-        RoundRect(dc, 20, 35, 160, 230, 28, 28);
-        RoundRect(dc, 188, 35, 328, 230, 28, 28);
-        Ellipse(dc, 35, 75, 70, 110); Ellipse(dc, 108, 75, 143, 110);
-        Rectangle(dc, 69, 58, 111, 132);
-        SelectObject(dc, oldBrush); DeleteObject(body);
-        SetTextColor(dc, RGB(55, 65, 81)); TextOutW(dc, 65, 10, L"FRONT", 5); TextOutW(dc, 235, 10, L"REAR", 4);
-        struct Spot { const wchar_t* name; int x, y; } spots[] = {
-            {L"Menu",112,145}, {L"View",38,145},
-            {L"Y1",202,60}, {L"Y2",202,105}, {L"Y3",290,60},
-            {L"M2",210,175}, {L"M3",282,175}
-        };
-        for (const auto& spot : spots) {
-            const bool active = selected == spot.name;
-            HBRUSH dot = CreateSolidBrush(active ? RGB(0, 120, 215) : RGB(90, 100, 115));
-            HGDIOBJ before = SelectObject(dc, dot); Ellipse(dc, spot.x, spot.y, spot.x + 22, spot.y + 22); SelectObject(dc, before); DeleteObject(dot);
-            SetTextColor(dc, active ? RGB(0, 90, 175) : RGB(45, 50, 60));
-            TextOutW(dc, spot.x - 2, spot.y + 24, spot.name, static_cast<int>(wcslen(spot.name)));
+        const bool front = selected == L"Menu" || selected == L"View";
+        std::wstring callout;
+        if (selected == L"Menu") callout = L"29"; else if (selected == L"View") callout = L"31";
+        else if (selected == L"Y1") callout = L"24"; else if (selected == L"Y2") callout = L"25";
+        else if (selected == L"Y3") callout = L"18"; else if (selected == L"M2") callout = L"16";
+        else if (selected == L"M3") callout = L"17";
+        SetTextColor(dc, RGB(235, 238, 245));
+        const std::wstring heading = (front ? L"FRONT CONTROLS - " : L"REAR CONTROLS - ") + selected +
+                                     (callout.empty() ? L"" : L" (callout " + callout + L")");
+        RECT headingRect{8, 7, 342, 30}; DrawTextW(dc, heading.c_str(), -1, &headingRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        const RECT imageRect{7, 34, 343, 252};
+        if (!DrawBitmapFit(dc, front ? g_frontBitmap : g_rearBitmap, imageRect)) {
+            SetTextColor(dc, RGB(245, 180, 70));
+            RECT errorRect{15, 100, 335, 145}; DrawTextW(dc, L"Controller reference image unavailable", -1, &errorRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        SetTextColor(dc, RGB(135, 140, 150));
-        Ellipse(dc, 248, 130, 270, 152); TextOutW(dc, 244, 154, L"M1 n/a", 6);
-        SetTextColor(dc, RGB(75, 80, 90));
-        TextOutW(dc, 32, 255, L"Menu / View", 11); TextOutW(dc, 200, 255, L"Y / M rear buttons", 18);
-        SelectObject(dc, oldPen); DeleteObject(pen); EndPaint(hwnd, &paint); return 0;
+        SetTextColor(dc, RGB(190, 195, 205));
+        const wchar_t* footer = front ? L"Front reference: 29 Menu, 31 View" : L"Rear reference: 16 M2, 17 M3, 18 Y3, 24 Y1, 25 Y2";
+        RECT footerRect{7, 258, 343, 286}; DrawTextW(dc, footer, -1, &footerRect, DT_CENTER | DT_WORDBREAK);
+        EndPaint(hwnd, &paint); return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
@@ -1086,7 +1102,7 @@ void UpdateSettingsRuntime() {
     if (!g_settings || !IsWindow(g_settings)) return;
     const RuntimeStatus status = RuntimeSnapshot();
     std::wstring text = status.profileActive ? L"Active profile: " + status.profileName : L"Active target: Base";
-    text += L" — " + std::to_wstring(status.desired.stapm) + L"/" + std::to_wstring(status.desired.fast) + L"/" + std::to_wstring(status.desired.slow) + L" W";
+    text += L" - " + std::to_wstring(status.desired.stapm) + L"/" + std::to_wstring(status.desired.fast) + L"/" + std::to_wstring(status.desired.slow) + L" W";
     if (status.applyKnown && !status.applyOk) text += L"\r\n" + status.error;
     SetText(g_settings, IDC_TDP_STATUS, text);
     HWND battery = GetDlgItem(g_settings, IDC_BATTERY);
@@ -1292,7 +1308,7 @@ void UpdateTrayTip() {
 void ShowTrayMenu(HWND hwnd) {
     const RuntimeStatus status = RuntimeSnapshot(); HMENU menu = CreatePopupMenu();
     std::wstring active = status.profileActive ? L"Active: " + status.profileName : L"Active: Base";
-    active += L" — " + std::to_wstring(status.desired.stapm) + L"/" + std::to_wstring(status.desired.fast) + L"/" + std::to_wstring(status.desired.slow) + L" W";
+    active += L" - " + std::to_wstring(status.desired.stapm) + L"/" + std::to_wstring(status.desired.fast) + L"/" + std::to_wstring(status.desired.slow) + L" W";
     if (status.applyKnown && !status.applyOk) active += L" (apply failed)";
     AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, active.c_str()); AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_TDP, L"Open TDP setter");
@@ -1377,9 +1393,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     RegisterWindowClass(PROFILES_CLASS, ProfilesProc); RegisterWindowClass(PROFILE_EDITOR_CLASS, ProfileEditorProc);
     RegisterWindowClass(DIAGRAM_CLASS, DiagramProc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
     g_icon = CreateTrayIcon();
+    g_frontBitmap = static_cast<HBITMAP>(LoadImageW(instance, MAKEINTRESOURCEW(IDB_LEGIONGO_FRONT), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
+    g_rearBitmap = static_cast<HBITMAP>(LoadImageW(instance, MAKEINTRESOURCEW(IDB_LEGIONGO_REAR), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
+    if (!g_frontBitmap || !g_rearBitmap) LogAlways(L"Controller image resource could not be loaded.");
     g_hidden = CreateWindowExW(0, HIDDEN_CLASS, APP_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 300, 200, nullptr, nullptr, instance, nullptr);
     if (!g_hidden) {
         if (g_icon) DestroyIcon(g_icon); if (g_font) DeleteObject(g_font);
+        if (g_frontBitmap) DeleteObject(g_frontBitmap); if (g_rearBitmap) DeleteObject(g_rearBitmap);
         if (g_singleton) { ReleaseMutex(g_singleton); CloseHandle(g_singleton); } return 2;
     }
     StartWorker();
@@ -1395,6 +1415,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     StopWorker();
     if (getMessageResult < 0) LogAlways(L"GetMessage failed: " + std::to_wstring(GetLastError()));
     if (g_icon) DestroyIcon(g_icon); if (g_font) DeleteObject(g_font);
+    if (g_frontBitmap) DeleteObject(g_frontBitmap); if (g_rearBitmap) DeleteObject(g_rearBitmap);
     if (g_singleton) { ReleaseMutex(g_singleton); CloseHandle(g_singleton); }
     return static_cast<int>(message.wParam);
 }

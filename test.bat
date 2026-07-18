@@ -8,7 +8,7 @@ set "BUILD_DIR=%CD%\build"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%" || exit /b 1
 
 rem Build only the platform-independent core and its tests.
-cl /nologo /std:c++17 /EHsc /W4 /O2 /DNDEBUG /DUNICODE /D_UNICODE LegionGoCore.cpp LegionGoCoreTests.cpp /Fo"%BUILD_DIR%\\" /Fe"%BUILD_DIR%\LegionGoCoreTests.exe" /link /MACHINE:X64 /SUBSYSTEM:CONSOLE
+cl /nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DNDEBUG /DUNICODE /D_UNICODE LegionGoCore.cpp LegionGoCoreTests.cpp /Fo"%BUILD_DIR%\\" /Fe"%BUILD_DIR%\LegionGoCoreTests.exe" /link /MACHINE:X64 /SUBSYSTEM:CONSOLE
 if errorlevel 1 exit /b 1
 
 "%BUILD_DIR%\LegionGoCoreTests.exe"
