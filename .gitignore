@@ -1,0 +1,13 @@
+# Local build intermediates and test executable
+/build/
+*.obj
+*.pdb
+*.ilk
+
+# Runtime state (created beside the executables)
+LegionGoControl.ini
+LegionGoControl.log
+LegionGoNativeWmiProbe.log
+LegionGoNativeWmiProbe_state.txt
+LegionGoBatteryLimitState.txt
+*.tmp
