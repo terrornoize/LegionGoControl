@@ -788,9 +788,25 @@ void StopWorker() {
 RuntimeStatus RuntimeSnapshot() { std::lock_guard<std::mutex> lock(g_workerMutex); return g_runtime; }
 
 // ---------- UI helpers ----------
+UINT SystemDpi() {
+    using GetDpiForSystemFn = UINT (WINAPI*)();
+    static const auto function = reinterpret_cast<GetDpiForSystemFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForSystem"));
+    if (function) return function();
+    HDC screen = GetDC(nullptr); const UINT dpi = screen ? static_cast<UINT>(GetDeviceCaps(screen, LOGPIXELSX)) : 96U;
+    if (screen) ReleaseDC(nullptr, screen); return dpi ? dpi : 96U;
+}
+UINT WindowDpi(HWND window) {
+    using GetDpiForWindowFn = UINT (WINAPI*)(HWND);
+    static const auto function = reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+    const UINT dpi = function && window ? function(window) : SystemDpi(); return dpi ? dpi : 96U;
+}
+int DpiScale(int value, UINT dpi) { return MulDiv(value, static_cast<int>(dpi), 96); }
+int DpiScale(HWND window, int value) { return DpiScale(value, WindowDpi(window)); }
 void SetControlFont(HWND control) { if (control && g_font) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE); }
 HWND Control(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0) {
-    HWND result = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+    const UINT dpi = WindowDpi(parent);
+    HWND result = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style,
+                                  DpiScale(x, dpi), DpiScale(y, dpi), DpiScale(w, dpi), DpiScale(h, dpi), parent,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
     SetControlFont(result); return result;
 }
@@ -931,6 +947,8 @@ LRESULT CALLBACK DiagramProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     if (message == WM_PAINT) {
         PAINTSTRUCT paint{}; HDC dc = BeginPaint(hwnd, &paint); RECT client{}; GetClientRect(hwnd, &client);
         HBRUSH background = CreateSolidBrush(RGB(247, 249, 252)); FillRect(dc, &client, background); DeleteObject(background);
+        SetMapMode(dc, MM_ANISOTROPIC); SetWindowExtEx(dc, 350, 292, nullptr);
+        SetViewportExtEx(dc, (std::max)(1L, client.right - client.left), (std::max)(1L, client.bottom - client.top), nullptr);
         SetBkMode(dc, TRANSPARENT); SelectObject(dc, g_font);
         HWND settings = GetParent(hwnd); SettingsState* state = SettingsData(settings);
         const std::wstring selected = state && !state->buttons.empty() ? state->buttons[static_cast<std::size_t>(state->selectedButton)].name : L"";
@@ -964,18 +982,18 @@ LRESULT CALLBACK DiagramProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
 }
 
 void CreateSettingsControls(HWND hwnd, SettingsState& state) {
-    HWND tab = Control(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP, 12, 12, 736, 446, IDC_TAB);
+    HWND tab = Control(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP, 12, 12, 876, 548, IDC_TAB);
     TCITEMW item{}; item.mask = TCIF_TEXT;
     wchar_t general[] = L"General", controller[] = L"Controller", tdp[] = L"TDP";
     item.pszText = general; TabCtrl_InsertItem(tab, 0, &item); item.pszText = controller; TabCtrl_InsertItem(tab, 1, &item); item.pszText = tdp; TabCtrl_InsertItem(tab, 2, &item);
-    Control(hwnd, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 506, 470, 76, 28, IDC_OK);
-    Control(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 590, 470, 76, 28, IDC_CANCEL);
-    Control(hwnd, L"BUTTON", L"Apply", BS_PUSHBUTTON | WS_TABSTOP, 674, 470, 76, 28, IDC_APPLY);
+    Control(hwnd, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 638, 578, 76, 32, IDC_OK);
+    Control(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 722, 578, 76, 32, IDC_CANCEL);
+    Control(hwnd, L"BUTTON", L"Apply", BS_PUSHBUTTON | WS_TABSTOP, 806, 578, 76, 32, IDC_APPLY);
     const int x = 34, y = 62;
     PageField(state, 0, hwnd, L"BUTTON", L"Enable diagnostic logging", BS_AUTOCHECKBOX | WS_TABSTOP, x, y, 260, 24, IDC_LOGGING);
     PageField(state, 0, hwnd, L"BUTTON", L"Start with Windows (elevated task)", BS_AUTOCHECKBOX | WS_TABSTOP, x, y + 36, 300, 24, IDC_STARTUP);
-    PageField(state, 0, hwnd, L"BUTTON", L"Battery charge limit 80%", BS_AUTOCHECKBOX | WS_TABSTOP, x, y + 72, 260, 24, IDC_BATTERY);
-    PageField(state, 0, hwnd, L"STATIC", L"Reading firmware state...", SS_LEFT, x + 280, y + 74, 330, 22, IDC_BATTERY_STATUS);
+    PageField(state, 0, hwnd, L"BUTTON", L"Battery charge limit 80%", BS_AUTOCHECKBOX | WS_TABSTOP, x, y + 72, 320, 28, IDC_BATTERY);
+    PageField(state, 0, hwnd, L"STATIC", L"Reading firmware state...", SS_LEFT, x + 340, y + 75, 430, 24, IDC_BATTERY_STATUS);
     Label(state, 0, hwnd, L"HID debounce (0-1000 ms):", x, y + 125, 210, 22);
     PageField(state, 0, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 220, y + 122, 90, 24, IDC_DEBOUNCE, WS_EX_CLIENTEDGE);
     Label(state, 0, hwnd, L"Action cooldown (50-5000 ms):", x, y + 163, 230, 22);
@@ -999,8 +1017,8 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 1, hwnd, L"Arguments:", x, y + 188, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 184, 245, 24, IDC_BUTTON_ARGS, WS_EX_CLIENTEDGE);
     Label(state, 1, hwnd, L"Work dir:", x, y + 222, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 218, 245, 24, IDC_BUTTON_WORKDIR, WS_EX_CLIENTEDGE);
     Label(state, 1, hwnd, L"Internal:", x, y + 256, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 252, 245, 24, IDC_BUTTON_INTERNAL, WS_EX_CLIENTEDGE);
-    PageField(state, 1, hwnd, DIAGRAM_CLASS, L"", WS_BORDER, 370, y, 350, 292, IDC_DIAGRAM, WS_EX_CLIENTEDGE);
-    Label(state, 1, hwnd, L"M1 remains intentionally unmapped because it overlaps the normal RB/gamepad path.", x, y + 315, 665, 35);
+    PageField(state, 1, hwnd, DIAGRAM_CLASS, L"", WS_BORDER, 470, y, 390, 326, IDC_DIAGRAM, WS_EX_CLIENTEDGE);
+    Label(state, 1, hwnd, L"M1 remains intentionally unmapped because it overlaps the normal RB/gamepad path.", x, y + 350, 800, 35);
 
     Label(state, 2, hwnd, L"Base TDP is restored whenever no configured game is running and on a clean exit.", x, y, 650, 24);
     Label(state, 2, hwnd, L"STAPM (W)", x, y + 50, 100, 22); Label(state, 2, hwnd, L"FAST (W)", x + 145, y + 50, 100, 22); Label(state, 2, hwnd, L"SLOW (W)", x + 290, y + 50, 100, 22);
@@ -1082,8 +1100,9 @@ void UpdateSettingsRuntime() {
 }
 void ShowSettings(int tab) {
     if (!g_settings || !IsWindow(g_settings)) {
+        const UINT dpi = SystemDpi();
         g_settings = CreateWindowExW(WS_EX_APPWINDOW, SETTINGS_CLASS, L"LegionGoControl Settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                     CW_USEDEFAULT, CW_USEDEFAULT, 778, 548, nullptr, nullptr, g_instance, nullptr);
+                                     CW_USEDEFAULT, CW_USEDEFAULT, DpiScale(920, dpi), DpiScale(660, dpi), nullptr, nullptr, g_instance, nullptr);
         if (g_settings) CenterWindow(g_settings, nullptr);
     } else if (!IsWindowVisible(g_settings)) PopulateSettings(g_settings);
     if (!g_settings) return;
@@ -1149,8 +1168,10 @@ LRESULT CALLBACK ProfileEditorProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
 }
 bool EditProfileModal(HWND owner, ProfileEditorContext& context) {
     EnableWindow(owner, FALSE);
+    const UINT dpi = WindowDpi(owner);
     HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, PROFILE_EDITOR_CLASS, context.editing == LegionGoCore::kNoProfile ? L"Add game profile" : L"Edit game profile",
-                                  WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 584, 310, owner, nullptr, g_instance, &context);
+                                  WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  DpiScale(584, dpi), DpiScale(310, dpi), owner, nullptr, g_instance, &context);
     if (!window) { EnableWindow(owner, TRUE); return false; }
     CenterWindow(window, owner); ShowWindow(window, SW_SHOW); SetForegroundWindow(window);
     MSG message{};
@@ -1186,14 +1207,16 @@ void SaveProfileChanges(const std::vector<StoredProfile>& profiles) {
 LRESULT CALLBACK ProfilesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
-            HWND list = Control(hwnd, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, 12, 12, 706, 330, IDC_PROFILE_LIST, WS_EX_CLIENTEDGE);
+            HWND list = Control(hwnd, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, 12, 12, 916, 430, IDC_PROFILE_LIST, WS_EX_CLIENTEDGE);
             ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-            for (const auto& column : std::vector<std::pair<const wchar_t*, int>>{{L"Name",115},{L"Executable",285},{L"STAPM",65},{L"FAST",60},{L"SLOW",60},{L"Status",75}}) {
-                LVCOLUMNW data{}; data.mask = LVCF_TEXT | LVCF_WIDTH; data.pszText = const_cast<wchar_t*>(column.first); data.cx = column.second; ListView_InsertColumn(list, Header_GetItemCount(ListView_GetHeader(list)), &data);
+            for (const auto& column : std::vector<std::pair<const wchar_t*, int>>{{L"Name",140},{L"Executable",470},{L"STAPM",70},{L"FAST",65},{L"SLOW",65},{L"Status",90}}) {
+                LVCOLUMNW data{}; data.mask = LVCF_TEXT | LVCF_WIDTH; data.pszText = const_cast<wchar_t*>(column.first);
+                data.cx = DpiScale(column.second, WindowDpi(hwnd));
+                ListView_InsertColumn(list, Header_GetItemCount(ListView_GetHeader(list)), &data);
             }
-            Control(hwnd, L"BUTTON", L"+ Add profile", BS_PUSHBUTTON, 12, 354, 100, 28, IDC_PROFILE_ADD); Control(hwnd, L"BUTTON", L"Edit...", BS_PUSHBUTTON, 120, 354, 80, 28, IDC_PROFILE_EDIT);
-            Control(hwnd, L"BUTTON", L"Remove", BS_PUSHBUTTON, 208, 354, 80, 28, IDC_PROFILE_REMOVE); Control(hwnd, L"BUTTON", L"Move up", BS_PUSHBUTTON, 304, 354, 86, 28, IDC_PROFILE_UP);
-            Control(hwnd, L"BUTTON", L"Move down", BS_PUSHBUTTON, 398, 354, 92, 28, IDC_PROFILE_DOWN); Control(hwnd, L"BUTTON", L"Close", BS_DEFPUSHBUTTON, 638, 354, 80, 28, IDC_PROFILE_CLOSE);
+            Control(hwnd, L"BUTTON", L"+ Add profile", BS_PUSHBUTTON, 12, 450, 110, 32, IDC_PROFILE_ADD); Control(hwnd, L"BUTTON", L"Edit...", BS_PUSHBUTTON, 130, 450, 82, 32, IDC_PROFILE_EDIT);
+            Control(hwnd, L"BUTTON", L"Remove", BS_PUSHBUTTON, 220, 450, 86, 32, IDC_PROFILE_REMOVE); Control(hwnd, L"BUTTON", L"Move up", BS_PUSHBUTTON, 322, 450, 90, 32, IDC_PROFILE_UP);
+            Control(hwnd, L"BUTTON", L"Move down", BS_PUSHBUTTON, 420, 450, 100, 32, IDC_PROFILE_DOWN); Control(hwnd, L"BUTTON", L"Close", BS_DEFPUSHBUTTON, 848, 450, 80, 32, IDC_PROFILE_CLOSE);
             FillProfileList(hwnd); return 0;
         }
         case WM_NOTIFY: {
@@ -1229,8 +1252,9 @@ LRESULT CALLBACK ProfilesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 }
 void ShowProfilesWindow() {
     if (!g_profilesWindow || !IsWindow(g_profilesWindow)) {
+        const UINT dpi = SystemDpi();
         g_profilesWindow = CreateWindowExW(WS_EX_APPWINDOW, PROFILES_CLASS, L"LegionGoControl Game Profiles", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                           CW_USEDEFAULT, CW_USEDEFAULT, 750, 430, nullptr, nullptr, g_instance, nullptr);
+                                           CW_USEDEFAULT, CW_USEDEFAULT, DpiScale(960, dpi), DpiScale(570, dpi), nullptr, nullptr, g_instance, nullptr);
         if (g_profilesWindow) CenterWindow(g_profilesWindow, g_settings);
     } else FillProfileList(g_profilesWindow);
     if (g_profilesWindow) { ShowWindow(g_profilesWindow, SW_SHOWNORMAL); SetForegroundWindow(g_profilesWindow); }
@@ -1345,8 +1369,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         CloseHandle(g_singleton); g_singleton = nullptr; return 0;
     }
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&controls);
-    NONCLIENTMETRICSW metrics{}; metrics.cbSize = sizeof(metrics);
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) g_font = CreateFontIndirectW(&metrics.lfMessageFont);
+    const UINT dpi = SystemDpi();
+    g_font = CreateFontW(-MulDiv(10, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     RegisterWindowClass(HIDDEN_CLASS, HiddenProc, nullptr); RegisterWindowClass(SETTINGS_CLASS, SettingsProc);
     RegisterWindowClass(PROFILES_CLASS, ProfilesProc); RegisterWindowClass(PROFILE_EDITOR_CLASS, ProfileEditorProc);
     RegisterWindowClass(DIAGRAM_CLASS, DiagramProc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
