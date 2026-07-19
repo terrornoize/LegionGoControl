@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -32,6 +33,20 @@ bool ValidateTdpTriple(int stapm, int fast, int slow, std::wstring* error = null
 // Raises dependent limits only: SLOW becomes at least STAPM and FAST becomes
 // at least both. It does not clamp the overall 5-35 W range.
 TdpTriple NormalizeTdpHierarchy(TdpTriple value) noexcept;
+
+inline constexpr std::size_t kFanPointCount = 10;
+inline constexpr std::array<int, kFanPointCount> kFanTemperaturesC{
+    10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+struct FanCurve {
+    std::array<int, kFanPointCount> dutyPercent{};
+};
+bool operator==(const FanCurve& left, const FanCurve& right) noexcept;
+bool operator!=(const FanCurve& left, const FanCurve& right) noexcept;
+// Legion Go firmware exposes ten fixed temperature breakpoints. Duty must be
+// monotonic, remain in 20-100%, and retain conservative high-temperature floors.
+bool ValidateFanCurve(const FanCurve& curve, std::wstring* error = nullptr);
+int InterpolateFanDuty(const FanCurve& curve, int temperatureC) noexcept;
+int EstimateFanRpm(int dutyPercent) noexcept;
 
 struct GameProfile {
     std::wstring name;

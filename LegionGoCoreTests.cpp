@@ -56,6 +56,27 @@ void TestTdpValidation() {
     CHECK((TdpTriple{5, 6, 7} != TdpTriple{5, 7, 7}));
 }
 
+void TestFanCurve() {
+    FanCurve baseline{{44,48,48,51,51,55,60,71,87,87}};
+    std::wstring error = L"stale";
+    CHECK(ValidateFanCurve(baseline, &error));
+    CHECK(error.empty());
+    CHECK((baseline == FanCurve{{44,48,48,51,51,55,60,71,87,87}}));
+    CHECK((baseline != FanCurve{{44,48,48,51,51,55,60,71,87,88}}));
+    CHECK(!ValidateFanCurve(FanCurve{{19,20,30,40,50,60,70,80,90,100}}, &error));
+    CHECK(error.find(L"20%") != std::wstring::npos);
+    CHECK(!ValidateFanCurve(FanCurve{{30,30,30,29,50,60,70,80,90,100}}, &error));
+    CHECK(error.find(L"decrease") != std::wstring::npos);
+    CHECK(!ValidateFanCurve(FanCurve{{20,20,20,20,20,20,20,59,80,85}}, &error));
+    CHECK(error.find(L"Safety") != std::wstring::npos);
+    CHECK(InterpolateFanDuty(baseline, 5) == 44);
+    CHECK(InterpolateFanDuty(baseline, 45) == 51);
+    CHECK(InterpolateFanDuty(baseline, 65) == 58);
+    CHECK(InterpolateFanDuty(baseline, 105) == 87);
+    CHECK(EstimateFanRpm(28) == 2100);
+    CHECK(EstimateFanRpm(84) == 6300);
+}
+
 void TestPathNormalization() {
     CHECK(NormalizeWindowsPath(L"").empty());
     CHECK(NormalizeWindowsPath(L"C:/Games/Foo.EXE") == L"c:\\games\\foo.exe");
@@ -257,6 +278,7 @@ void TestTargetSemantics() {
 
 int main() {
     TestTdpValidation();
+    TestFanCurve();
     TestPathNormalization();
     TestProfileValidation();
     TestArbiter();

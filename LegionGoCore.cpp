@@ -163,6 +163,50 @@ TdpTriple NormalizeTdpHierarchy(TdpTriple value) noexcept {
     return value;
 }
 
+bool operator==(const FanCurve& left, const FanCurve& right) noexcept {
+    return left.dutyPercent == right.dutyPercent;
+}
+bool operator!=(const FanCurve& left, const FanCurve& right) noexcept { return !(left == right); }
+
+bool ValidateFanCurve(const FanCurve& curve, std::wstring* error) {
+    for (std::size_t index = 0; index < curve.dutyPercent.size(); ++index) {
+        const int duty = curve.dutyPercent[index];
+        if (duty < 20 || duty > 100) {
+            SetError(error, L"Every fan point must be between 20% and 100%.");
+            return false;
+        }
+        if (index != 0 && duty < curve.dutyPercent[index - 1]) {
+            SetError(error, L"Fan duty must not decrease as temperature rises.");
+            return false;
+        }
+    }
+    if (curve.dutyPercent[7] < 60 || curve.dutyPercent[8] < 80 || curve.dutyPercent[9] < 85) {
+        SetError(error, L"Safety minimums are 60% at 80 C, 80% at 90 C, and 85% at 100 C.");
+        return false;
+    }
+    SetError(error, L"");
+    return true;
+}
+
+int InterpolateFanDuty(const FanCurve& curve, int temperatureC) noexcept {
+    if (temperatureC <= kFanTemperaturesC.front()) return curve.dutyPercent.front();
+    if (temperatureC >= kFanTemperaturesC.back()) return curve.dutyPercent.back();
+    for (std::size_t index = 1; index < kFanPointCount; ++index) {
+        if (temperatureC <= kFanTemperaturesC[index]) {
+            const int lowTemperature = kFanTemperaturesC[index - 1];
+            const int span = kFanTemperaturesC[index] - lowTemperature;
+            const int lowDuty = curve.dutyPercent[index - 1];
+            const int delta = curve.dutyPercent[index] - lowDuty;
+            return lowDuty + (delta * (temperatureC - lowTemperature) + span / 2) / span;
+        }
+    }
+    return curve.dutyPercent.back();
+}
+
+int EstimateFanRpm(int dutyPercent) noexcept {
+    return (std::max)(0, (std::min)(100, dutyPercent)) * 75;
+}
+
 std::wstring NormalizeWindowsPath(const std::wstring& originalPath) {
     if (originalPath.empty()) {
         return {};

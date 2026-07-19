@@ -1,8 +1,8 @@
-# LegionGoControl V2 (beta)
+# LegionGoControl V2.1 (beta)
 
-LegionGoControl is a native Windows tray utility for the **Lenovo Legion Go 1 / 8APU1 / Z1 Extreme**. V2 adds a graphical settings interface and per-executable TDP profiles while keeping the original Raw Input button mapper and Lenovo WMI backend.
+LegionGoControl is a native Windows tray utility for the **Lenovo Legion Go 1 / 8APU1 / Z1 Extreme**. V2.1 adds a graphical settings interface, per-executable TDP profiles and a firmware fan-curve editor while keeping the original Raw Input button mapper and Lenovo WMI backend.
 
-> **Hardware beta:** the application and pure logic have been built and tested on a normal Windows PC, not on a Legion Go. Lenovo HID input, firmware TDP writes, battery charge limit and restore behavior must be validated on the target Legion Go before daily use.
+> **Hardware beta:** fan telemetry, curve read/write/read-back and restore have been tested remotely on model `83E1 / Legion Go 8APU1`, BIOS `N3CN37WW`. Lenovo HID, TDP and battery behavior still require target-device validation before daily use, and other BIOS versions remain unverified.
 
 ## Components
 
@@ -14,8 +14,9 @@ LegionGoControl.exe
 └─ serialized calls to the backend
 
 LegionGoNativeWmiProbe.exe
-├─ Lenovo WMI access through ROOT\WMI / LENOVO_OTHER_METHOD
+├─ Lenovo WMI access through ROOT\WMI / LENOVO_OTHER_METHOD / LENOVO_FAN_METHOD
 ├─ verified TDP transactions with rollback attempt
+├─ verified fan curve transactions, telemetry, backup and restore
 └─ verified battery-limit status/set/toggle
 ```
 
@@ -23,12 +24,12 @@ Both executables must remain in the same directory.
 
 ## Tray menu
 
-The V2 tray is intentionally small:
+The V2.1 tray is intentionally small:
 
 - **Open TDP setter** — opens the TDP tab in Settings;
-- **Settings...** — opens General, Controller, TDP and Info settings;
+- **Settings...** — opens General, Controller, TDP, Fan and Info settings;
 - **Game Profiles...** — manages per-executable TDP profiles;
-- version header (`LegionGoControl v2 YYYYMMDD`) and active target status;
+- version header (`LegionGoControl v2.1 YYYYMMDD`) and active target status;
 - **Exit**.
 
 Startup, battery limit and logging were moved from the tray into **Settings > General**.
@@ -66,7 +67,7 @@ M1 remains unsupported because it overlaps the normal RB/gamepad path on the tes
 
 ### Info
 
-The Info tab contains the current dated V2 version, a short English description, the GitHub repository link, hardware-beta notice, and the required attribution/link for the application icon.
+The Info tab contains the current dated V2.1 version, a short English description, the GitHub repository link, hardware-beta notice, and the required attribution/link for the application icon.
 
 ### TDP
 
@@ -87,6 +88,14 @@ This is the conventional AMD hierarchy documented by the RyzenAdj option guide: 
 Reference: <https://github.com/FlyGoat/RyzenAdj/wiki/Options#stapm>
 
 Balanced preset buttons set all three values to the same wattage. The base target is persisted and is restored whenever no configured Game Profile is running.
+
+### Fan
+
+The Fan tab provides a DPI-aware graph with ten draggable firmware nodes. Temperatures are fixed by the Legion Go firmware at `10, 20, ... 100 °C`; each node controls duty percent and shows an RPM estimate based on hardware calibration. The tab reads actual CPU temperature and fan RPM once per second while open, and displays the interpolated curve command percentage.
+
+Curve writes are explicit, validated, read back exactly and rolled back on failure. The backend preserves the original firmware curve on the first apply and restores it when custom control is disabled or LegionGoControl exits cleanly. Safety floors prevent decreasing curves and require at least `60% @ 80 °C`, `80% @ 90 °C`, and `85% @ 100 °C`. Firmware emergency protection always retains priority.
+
+Hardware observations on BIOS `N3CN37WW`: `28%` stabilized near `2100 RPM`; `84%` stabilized near `6280 RPM`; firmware ramps speed changes gradually rather than stepping immediately.
 
 ## Game Profiles
 
@@ -151,6 +160,16 @@ FastW=16
 SlowW=16
 ```
 
+Fan preferences use:
+
+```ini
+[Fan]
+Enabled=0
+Duty0=44
+Duty1=48
+; ... Duty9, corresponding to 10..100 C
+```
+
 Unknown INI keys and sections are not intentionally rewritten or deleted.
 
 ## Lenovo backend
@@ -162,6 +181,9 @@ STAPM = 0x0101FF00
 FAST  = 0x0102FF00
 SLOW  = 0x0103FF00
 Battery limit 80% = 0x03010001
+Fan full-speed override = 0x04020000
+Fan RPM telemetry = 0x04030001
+CPU temperature = 0x05040000
 ```
 
 The backend connects to:
@@ -170,6 +192,7 @@ The backend connects to:
 ROOT\WMI
 LENOVO_OTHER_METHOD
 LENOVO_OTHER_METHOD.InstanceName="ACPI\\PNP0C14\\GMZN_0"
+LENOVO_FAN_METHOD / Fan_Get_Table / Fan_Set_Table
 ```
 
 V2 improvements:
@@ -196,9 +219,11 @@ LegionGoControl.log
 LegionGoNativeWmiProbe.log
 LegionGoNativeWmiProbe_state.txt
 LegionGoBatteryLimitState.txt
+LegionGoFanState.txt
+LegionGoFanBackup.txt
 ```
 
-For V2 beta testing, use a directory writable only by the intended administrator account. The frontend currently still runs elevated, so controller `launch` actions inherit elevated privileges.
+For V2.1 beta testing, use a directory writable only by the intended administrator account. The frontend currently still runs elevated, so controller `launch` actions inherit elevated privileges.
 
 ## Build
 

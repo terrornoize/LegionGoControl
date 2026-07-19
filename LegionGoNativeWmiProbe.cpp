@@ -15,8 +15,10 @@
 #include <oleauto.h>
 #include <sddl.h>
 
+#include <array>
 #include <cerrno>
 #include <climits>
+#include <cstring>
 #include <cwctype>
 #include <limits>
 #include <sstream>
@@ -33,6 +35,9 @@ static constexpr int TDP_ID_STAPM = 0x0101FF00;
 static constexpr int TDP_ID_FAST  = 0x0102FF00;
 static constexpr int TDP_ID_SLOW  = 0x0103FF00;
 static constexpr int BATTERY_LIMIT_80_ID = 0x03010001;
+static constexpr int FAN_RPM_ID = 0x04030001;
+static constexpr int FAN_FULL_SPEED_ID = 0x04020000;
+static constexpr int CPU_TEMPERATURE_ID = 0x05040000;
 static constexpr int TDP_MIN_W = 5;
 static constexpr int TDP_MAX_W = 35;
 
@@ -40,10 +45,15 @@ static constexpr const wchar_t* TDP_MUTEX_NAME =
     L"Global\\LegionGoNativeWmiProbe_TdpTransaction_v1";
 static constexpr const wchar_t* BATTERY_MUTEX_NAME =
     L"Global\\LegionGoNativeWmiProbe_BatteryTransaction_v1";
+static constexpr const wchar_t* FAN_MUTEX_NAME =
+    L"Global\\LegionGoNativeWmiProbe_FanTransaction_v1";
+static constexpr std::array<int, 10> FAN_TEMPERATURES{10,20,30,40,50,60,70,80,90,100};
 
 static std::wstring g_baseDir;
 static std::wstring g_tdpStatePath;
 static std::wstring g_batteryStatePath;
+static std::wstring g_fanStatePath;
+static std::wstring g_fanBackupPath;
 static std::wstring g_logPath;
 
 static std::wstring ToUpper(std::wstring s) {
@@ -96,6 +106,8 @@ static void InitPaths() {
     g_baseDir = GetDirectoryOfPath(exePath);
     g_tdpStatePath = g_baseDir + L"\\LegionGoNativeWmiProbe_state.txt";
     g_batteryStatePath = g_baseDir + L"\\LegionGoBatteryLimitState.txt";
+    g_fanStatePath = g_baseDir + L"\\LegionGoFanState.txt";
+    g_fanBackupPath = g_baseDir + L"\\LegionGoFanBackup.txt";
     g_logPath = g_baseDir + L"\\LegionGoNativeWmiProbe.log";
 }
 
@@ -143,6 +155,34 @@ static bool WriteFileUtf16Replace(const std::wstring& path, const std::wstring& 
         temporaryPath.c_str(),
         path.c_str(),
         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+static bool ReadFileUtf16(const std::wstring& path, std::wstring& text) {
+    text.clear();
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 2 || size.QuadPart > 1024 * 1024) {
+        CloseHandle(file); return false;
+    }
+    std::vector<BYTE> bytes(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    const bool ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) != FALSE;
+    CloseHandle(file);
+    if (!ok || read < 2) return false;
+    const size_t offset = bytes[0] == 0xFF && bytes[1] == 0xFE ? 2 : 0;
+    text.assign(reinterpret_cast<const wchar_t*>(bytes.data() + offset), (read - offset) / sizeof(wchar_t));
+    return true;
+}
+
+static std::wstring StateField(const std::wstring& text, const std::wstring& key) {
+    std::wstringstream stream(text); std::wstring line; const std::wstring prefix = key + L"=";
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.compare(0, prefix.size(), prefix) == 0) return line.substr(prefix.size());
+    }
+    return L"";
 }
 
 static void AppendFileUtf16(const std::wstring& path, const std::wstring& text) {
@@ -545,7 +585,123 @@ public:
         return true;
     }
 
+    bool GetFanCurve(std::array<int, 10>& temperatures,
+                     std::array<int, 10>& speeds,
+                     std::wstring& error) {
+        ComPtr<IWbemClassObject> fanClass;
+        std::wstring objectPath;
+        if (!GetMethodTarget(L"LENOVO_FAN_METHOD", fanClass, objectPath, error)) return false;
+        UniqueBstr methodName(L"Fan_Get_Table");
+        ComPtr<IWbemClassObject> definition;
+        HRESULT hr = fanClass->GetMethod(methodName.Get(), 0, definition.Put(), nullptr);
+        if (FAILED(hr) || !definition) { error = L"Fan_Get_Table GetMethod failed " + HResultToHex(hr); return false; }
+        ComPtr<IWbemClassObject> input;
+        hr = definition->SpawnInstance(0, input.Put());
+        if (FAILED(hr) || !input) { error = L"Fan_Get_Table SpawnInstance failed " + HResultToHex(hr); return false; }
+        ScopedVariant fanId; fanId.Get()->vt = VT_UI1; fanId.Get()->bVal = 1;
+        hr = input->Put(L"FanID", 0, fanId.Get(), CIM_UINT8);
+        if (FAILED(hr)) { error = L"FanID Put failed " + HResultToHex(hr); return false; }
+        ScopedVariant sensorId; sensorId.Get()->vt = VT_UI1; sensorId.Get()->bVal = 0;
+        hr = input->Put(L"SensorID", 0, sensorId.Get(), CIM_UINT8);
+        if (FAILED(hr)) { error = L"SensorID Put failed " + HResultToHex(hr); return false; }
+        ComPtr<IWbemClassObject> output;
+        UniqueBstr path(objectPath.c_str());
+        hr = services_->ExecMethod(path.Get(), methodName.Get(), 0, nullptr, input.Get(), output.Put(), nullptr);
+        if (FAILED(hr) || !output) { error = L"Fan_Get_Table ExecMethod failed " + HResultToHex(hr); return false; }
+        ScopedVariant fanValues, sensorValues;
+        hr = output->Get(L"FanTable", 0, fanValues.Get(), nullptr, nullptr);
+        if (FAILED(hr) || !VariantArrayToTenInts(fanValues.Value(), speeds)) {
+            error = L"Invalid FanTable output " + HResultToHex(hr); return false;
+        }
+        hr = output->Get(L"SensorTable", 0, sensorValues.Get(), nullptr, nullptr);
+        if (FAILED(hr) || !VariantArrayToTenInts(sensorValues.Value(), temperatures)) {
+            error = L"Invalid SensorTable output " + HResultToHex(hr); return false;
+        }
+        return true;
+    }
+
+    bool SetFanCurve(const std::array<int, 10>& speeds, std::wstring& error) {
+        ComPtr<IWbemClassObject> fanClass;
+        std::wstring objectPath;
+        if (!GetMethodTarget(L"LENOVO_FAN_METHOD", fanClass, objectPath, error)) return false;
+        UniqueBstr methodName(L"Fan_Set_Table");
+        ComPtr<IWbemClassObject> definition;
+        HRESULT hr = fanClass->GetMethod(methodName.Get(), 0, definition.Put(), nullptr);
+        if (FAILED(hr) || !definition) { error = L"Fan_Set_Table GetMethod failed " + HResultToHex(hr); return false; }
+        ComPtr<IWbemClassObject> input;
+        hr = definition->SpawnInstance(0, input.Put());
+        if (FAILED(hr) || !input) { error = L"Fan_Set_Table SpawnInstance failed " + HResultToHex(hr); return false; }
+        std::array<BYTE, 64> bytes{};
+        bytes[0] = 1; bytes[1] = 0;
+        for (size_t index = 0; index < speeds.size(); ++index) {
+            const unsigned value = static_cast<unsigned>(speeds[index]);
+            bytes[6 + index * 2] = static_cast<BYTE>(value & 0xFF);
+            bytes[7 + index * 2] = static_cast<BYTE>((value >> 8) & 0xFF);
+        }
+        ScopedVariant table;
+        table.Get()->vt = VT_ARRAY | VT_UI1;
+        table.Get()->parray = SafeArrayCreateVector(VT_UI1, 0, static_cast<ULONG>(bytes.size()));
+        if (!table.Get()->parray) { error = L"Cannot allocate FanTable SAFEARRAY"; return false; }
+        void* raw = nullptr;
+        hr = SafeArrayAccessData(table.Get()->parray, &raw);
+        if (FAILED(hr) || !raw) { error = L"Cannot access FanTable SAFEARRAY " + HResultToHex(hr); return false; }
+        memcpy(raw, bytes.data(), bytes.size());
+        SafeArrayUnaccessData(table.Get()->parray);
+        hr = input->Put(L"FanTable", 0, table.Get(), static_cast<CIMTYPE>(CIM_FLAG_ARRAY | CIM_UINT8));
+        if (FAILED(hr)) { error = L"FanTable Put failed " + HResultToHex(hr); return false; }
+        ComPtr<IWbemClassObject> output;
+        UniqueBstr path(objectPath.c_str());
+        hr = services_->ExecMethod(path.Get(), methodName.Get(), 0, nullptr, input.Get(), output.Put(), nullptr);
+        if (FAILED(hr)) { error = L"Fan_Set_Table ExecMethod failed " + HResultToHex(hr); return false; }
+        return CheckReturnValue(output.Get(), L"Fan_Set_Table", error);
+    }
+
 private:
+    bool GetMethodTarget(const wchar_t* className,
+                         ComPtr<IWbemClassObject>& classObject,
+                         std::wstring& objectPath,
+                         std::wstring& error) {
+        UniqueBstr language(L"WQL");
+        const std::wstring queryText = std::wstring(L"SELECT * FROM ") + className + L" WHERE Active=True";
+        UniqueBstr query(queryText.c_str());
+        ComPtr<IEnumWbemClassObject> enumerator;
+        HRESULT hr = services_->ExecQuery(language.Get(), query.Get(),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, enumerator.Put());
+        if (FAILED(hr) || !enumerator) { error = L"Fan class query failed " + HResultToHex(hr); return false; }
+        ComPtr<IWbemClassObject> instance;
+        ULONG returned = 0;
+        hr = enumerator->Next(5000, 1, instance.Put(), &returned);
+        if (FAILED(hr) || returned != 1 || !instance) { error = L"Active fan WMI instance not found"; return false; }
+        ScopedVariant path;
+        hr = instance->Get(L"__PATH", 0, path.Get(), nullptr, nullptr);
+        if (FAILED(hr) || path.Value().vt != VT_BSTR || !path.Value().bstrVal) {
+            error = L"Fan WMI instance path unavailable"; return false;
+        }
+        objectPath = path.Value().bstrVal;
+        UniqueBstr name(className);
+        hr = services_->GetObject(name.Get(), 0, nullptr, classObject.Put(), nullptr);
+        if (FAILED(hr) || !classObject) { error = L"Fan class GetObject failed " + HResultToHex(hr); return false; }
+        return true;
+    }
+
+    static bool VariantArrayToTenInts(const VARIANT& value, std::array<int, 10>& result) {
+        if (!(value.vt & VT_ARRAY) || !value.parray || SafeArrayGetDim(value.parray) != 1) return false;
+        LONG lower = 0, upper = -1;
+        if (FAILED(SafeArrayGetLBound(value.parray, 1, &lower)) ||
+            FAILED(SafeArrayGetUBound(value.parray, 1, &upper)) || upper - lower + 1 != 10) return false;
+        const VARTYPE type = static_cast<VARTYPE>(value.vt & VT_TYPEMASK);
+        for (LONG index = lower; index <= upper; ++index) {
+            int parsed = 0;
+            HRESULT hr = E_FAIL;
+            if (type == VT_UI4) { ULONG item = 0; hr = SafeArrayGetElement(value.parray, &index, &item); if (item <= INT_MAX) parsed = static_cast<int>(item); else return false; }
+            else if (type == VT_I4) { LONG item = 0; hr = SafeArrayGetElement(value.parray, &index, &item); parsed = static_cast<int>(item); }
+            else if (type == VT_UI2) { USHORT item = 0; hr = SafeArrayGetElement(value.parray, &index, &item); parsed = static_cast<int>(item); }
+            else return false;
+            if (FAILED(hr)) return false;
+            result[static_cast<size_t>(index - lower)] = parsed;
+        }
+        return true;
+    }
     bool ExecLenovoMethod(
         const wchar_t* methodName,
         const std::vector<std::pair<std::wstring, long>>& arguments,
@@ -808,6 +964,99 @@ static bool WriteBatteryState(bool effectiveKnown, int effective, const std::wst
     if (!WriteFileUtf16Replace(g_batteryStatePath, state.str())) {
         Log(L"Failed to write battery state file");
         return false;
+    }
+    return true;
+}
+
+struct FanValues {
+    std::array<int, 10> temperatures{};
+    std::array<int, 10> speeds{};
+    int rpm = 0;
+    int temperatureC = 0;
+    int fullSpeed = 0;
+};
+
+static bool ValidateFanSpeeds(const std::array<int, 10>& speeds, std::wstring& error) {
+    for (size_t index = 0; index < speeds.size(); ++index) {
+        if (speeds[index] < 20 || speeds[index] > 100) {
+            error = L"Fan duty must be between 20 and 100 percent"; return false;
+        }
+        if (index != 0 && speeds[index] < speeds[index - 1]) {
+            error = L"Fan duty must not decrease as temperature rises"; return false;
+        }
+    }
+    if (speeds[7] < 60 || speeds[8] < 80 || speeds[9] < 85) {
+        error = L"Unsafe high-temperature fan curve"; return false;
+    }
+    return true;
+}
+
+static bool SameFanCurve(const std::array<int, 10>& left, const std::array<int, 10>& right) {
+    return left == right;
+}
+
+static bool ReadFanExact(WmiSession& wmi, FanValues& values, std::wstring& error) {
+    FanValues result;
+    if (!wmi.GetFanCurve(result.temperatures, result.speeds, error)) return false;
+    if (result.temperatures != FAN_TEMPERATURES) {
+        error = L"Unexpected firmware fan temperature table"; return false;
+    }
+    if (!ValidateFanSpeeds(result.speeds, error)) return false;
+    if (!wmi.GetFeatureValue(FAN_RPM_ID, result.rpm, error) || result.rpm < 0 || result.rpm > 20000) {
+        error = L"Invalid fan RPM telemetry: " + error; return false;
+    }
+    if (!wmi.GetFeatureValue(CPU_TEMPERATURE_ID, result.temperatureC, error) ||
+        result.temperatureC < 0 || result.temperatureC > 120) {
+        error = L"Invalid CPU temperature telemetry: " + error; return false;
+    }
+    if (!wmi.GetFeatureValue(FAN_FULL_SPEED_ID, result.fullSpeed, error) ||
+        (result.fullSpeed != 0 && result.fullSpeed != 1)) {
+        error = L"Invalid full-speed state: " + error; return false;
+    }
+    values = result; return true;
+}
+
+static bool WriteFanBackup(bool active, const std::array<int, 10>& speeds) {
+    std::wstringstream state;
+    state << L"Active=" << (active ? L"True" : L"False") << L"\r\n";
+    for (size_t index = 0; index < speeds.size(); ++index)
+        state << L"Speed" << index << L"=" << speeds[index] << L"\r\n";
+    return WriteFileUtf16Replace(g_fanBackupPath, state.str());
+}
+
+static bool ReadFanBackup(std::array<int, 10>& speeds, bool& active) {
+    std::wstring text;
+    if (!ReadFileUtf16(g_fanBackupPath, text)) { active = false; return false; }
+    active = ToUpper(StateField(text, L"Active")) == L"TRUE";
+    for (size_t index = 0; index < speeds.size(); ++index) {
+        const std::wstring value = StateField(text, L"Speed" + std::to_wstring(index));
+        if (!ParseIntStrict(value.c_str(), speeds[index])) return false;
+    }
+    std::wstring error; return ValidateFanSpeeds(speeds, error);
+}
+
+static bool WriteFanState(bool known, const FanValues& values, const std::wstring& error) {
+    std::array<int, 10> backup{}; bool backupActive = false;
+    (void)ReadFanBackup(backup, backupActive);
+    std::wstringstream state;
+    state << L"Timestamp=" << NowString() << L"\r\nKnown=" << (known ? L"True" : L"False") << L"\r\n";
+    state << L"BackupActive=" << (backupActive ? L"True" : L"False") << L"\r\n";
+    if (known) {
+        state << L"Rpm=" << values.rpm << L"\r\nTemperatureC=" << values.temperatureC
+              << L"\r\nFullSpeed=" << values.fullSpeed << L"\r\n";
+        for (size_t index = 0; index < values.speeds.size(); ++index)
+            state << L"Temp" << index << L"=" << values.temperatures[index] << L"\r\nSpeed" << index << L"=" << values.speeds[index] << L"\r\n";
+    }
+    state << L"Error=" << error << L"\r\n";
+    return WriteFileUtf16Replace(g_fanStatePath, state.str());
+}
+
+static bool ApplyFanVerified(WmiSession& wmi, const std::array<int, 10>& target, std::wstring& error) {
+    if (!wmi.SetFanCurve(target, error)) return false;
+    std::array<int, 10> temperatures{}, actual{};
+    if (!wmi.GetFanCurve(temperatures, actual, error)) return false;
+    if (temperatures != FAN_TEMPERATURES || !SameFanCurve(actual, target)) {
+        error = L"Fan curve read-back mismatch"; return false;
     }
     return true;
 }
@@ -1198,6 +1447,78 @@ static int DoBatteryToggle() {
     return ReturnCode(0);
 }
 
+static int DoFanStatus() {
+    std::wstring error; NamedMutexLock lock;
+    if (!lock.Acquire(FAN_MUTEX_NAME, error)) { WriteFanState(false, {}, error); return ReturnCode(60); }
+    WmiSession wmi;
+    if (!OpenWmiAsAdmin(wmi, error)) { WriteFanState(false, {}, error); return ReturnCode(61); }
+    FanValues values;
+    if (!ReadFanExact(wmi, values, error)) { WriteFanState(false, {}, error); ConsoleWrite(L"ERROR: " + error + L"\r\n"); return ReturnCode(62); }
+    if (!WriteFanState(true, values, L"")) return ReturnCode(63);
+    ConsoleWrite(L"OK\r\nRPM=" + std::to_wstring(values.rpm) + L"\r\nTEMP=" + std::to_wstring(values.temperatureC) + L"\r\n");
+    return ReturnCode(0);
+}
+
+static int DoFanSet(const std::array<int, 10>& target) {
+    std::wstring error;
+    if (!ValidateFanSpeeds(target, error)) { ConsoleWrite(L"ERROR: " + error + L"\r\n"); return ReturnCode(70); }
+    NamedMutexLock lock;
+    if (!lock.Acquire(FAN_MUTEX_NAME, error)) return ReturnCode(71);
+    WmiSession wmi;
+    if (!OpenWmiAsAdmin(wmi, error)) return ReturnCode(72);
+    FanValues snapshot;
+    if (!ReadFanExact(wmi, snapshot, error)) { WriteFanState(false, {}, error); return ReturnCode(73); }
+    if (snapshot.fullSpeed != 0) {
+        error = L"Full-speed override is active; refusing curve write"; WriteFanState(true, snapshot, error); return ReturnCode(74);
+    }
+    std::array<int, 10> backup{}; bool backupActive = false;
+    const bool haveBackup = ReadFanBackup(backup, backupActive);
+    const bool createdBackup = !haveBackup || !backupActive;
+    if (createdBackup && !WriteFanBackup(true, snapshot.speeds)) return ReturnCode(75);
+    if (!ApplyFanVerified(wmi, target, error)) {
+        std::wstring rollbackError;
+        const bool rolledBack = ApplyFanVerified(wmi, snapshot.speeds, rollbackError);
+        FanValues effective; std::wstring readError;
+        const bool known = ReadFanExact(wmi, effective, readError);
+        error += rolledBack ? L"; rollback verified" : L"; rollback failed: " + rollbackError;
+        if (rolledBack && createdBackup && !WriteFanBackup(false, snapshot.speeds))
+            error += L"; backup marker cleanup failed";
+        WriteFanState(known, effective, error);
+        return ReturnCode(rolledBack ? 76 : 77);
+    }
+    FanValues effective;
+    if (!ReadFanExact(wmi, effective, error)) { WriteFanState(false, {}, error); return ReturnCode(78); }
+    if (!WriteFanState(true, effective, L"")) return ReturnCode(79);
+    return ReturnCode(0);
+}
+
+static int DoFanRestore() {
+    std::wstring error; NamedMutexLock lock;
+    if (!lock.Acquire(FAN_MUTEX_NAME, error)) return ReturnCode(80);
+    std::array<int, 10> backup{}; bool active = false;
+    const bool haveActiveBackup = ReadFanBackup(backup, active) && active;
+    WmiSession wmi;
+    if (!OpenWmiAsAdmin(wmi, error)) return ReturnCode(81);
+    if (!haveActiveBackup) {
+        FanValues unchanged;
+        if (!ReadFanExact(wmi, unchanged, error)) { WriteFanState(false, {}, error); return ReturnCode(84); }
+        if (!WriteFanState(true, unchanged, L"")) return ReturnCode(85);
+        return ReturnCode(0);
+    }
+    if (!ApplyFanVerified(wmi, backup, error)) {
+        const std::wstring firstError = error;
+        if (!ApplyFanVerified(wmi, backup, error)) {
+            WriteFanState(false, {}, L"Restore failed twice: " + firstError + L"; " + error);
+            return ReturnCode(82);
+        }
+    }
+    if (!WriteFanBackup(false, backup)) return ReturnCode(83);
+    FanValues effective;
+    if (!ReadFanExact(wmi, effective, error)) { WriteFanState(false, {}, error); return ReturnCode(84); }
+    if (!WriteFanState(true, effective, L"")) return ReturnCode(85);
+    return ReturnCode(0);
+}
+
 static int UsageError(const std::wstring& detail) {
     if (!detail.empty()) {
         ConsoleWrite(L"ERROR: " + detail + L"\r\n");
@@ -1208,7 +1529,10 @@ static int UsageError(const std::wstring& detail) {
         L"  LegionGoNativeWmiProbe.exe set <stapm> <fast> <slow>\r\n"
         L"  LegionGoNativeWmiProbe.exe battery-status\r\n"
         L"  LegionGoNativeWmiProbe.exe battery-set 0|1\r\n"
-        L"  LegionGoNativeWmiProbe.exe battery-toggle\r\n");
+        L"  LegionGoNativeWmiProbe.exe battery-toggle\r\n"
+        L"  LegionGoNativeWmiProbe.exe fan-status\r\n"
+        L"  LegionGoNativeWmiProbe.exe fan-set <10 duty percentages>\r\n"
+        L"  LegionGoNativeWmiProbe.exe fan-restore\r\n");
     return ReturnCode(2);
 }
 
@@ -1250,6 +1574,19 @@ int wmain(int argc, wchar_t** argv) {
     if (command == L"BATTERY-TOGGLE") {
         return argc == 2 ? DoBatteryToggle() :
             UsageError(L"battery-toggle takes no arguments");
+    }
+    if (command == L"FAN-STATUS") {
+        return argc == 2 ? DoFanStatus() : UsageError(L"fan-status takes no arguments");
+    }
+    if (command == L"FAN-SET") {
+        if (argc != 12) return UsageError(L"fan-set requires exactly ten percentages");
+        std::array<int, 10> speeds{};
+        for (size_t index = 0; index < speeds.size(); ++index)
+            if (!ParseIntStrict(argv[index + 2], speeds[index])) return UsageError(L"fan-set values must be integers");
+        return DoFanSet(speeds);
+    }
+    if (command == L"FAN-RESTORE") {
+        return argc == 2 ? DoFanRestore() : UsageError(L"fan-restore takes no arguments");
     }
 
     ConsoleWrite(L"Comando sconosciuto.\r\n");

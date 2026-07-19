@@ -9,6 +9,7 @@
 #endif
 
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -24,6 +25,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 #include <cwctype>
 #include <deque>
 #include <fstream>
@@ -46,19 +49,22 @@
 
 namespace {
 
-constexpr wchar_t APP_TITLE[] = L"LegionGoControl V2";
-constexpr wchar_t APP_VERSION[] = L"LegionGoControl v2 20260719";
+constexpr wchar_t APP_TITLE[] = L"LegionGoControl V2.1";
+constexpr wchar_t APP_VERSION[] = L"LegionGoControl v2.1 20260719";
 constexpr wchar_t REPOSITORY_URL[] = L"https://github.com/terrornoize/LegionGoControl";
 constexpr wchar_t HIDDEN_CLASS[] = L"LegionGoControlHiddenWindow";
 constexpr wchar_t SETTINGS_CLASS[] = L"LegionGoControlSettingsWindow";
 constexpr wchar_t PROFILES_CLASS[] = L"LegionGoControlProfilesWindow";
 constexpr wchar_t PROFILE_EDITOR_CLASS[] = L"LegionGoControlProfileEditor";
+constexpr wchar_t FAN_CURVE_CLASS[] = L"LegionGoControlFanCurve";
 constexpr wchar_t SINGLETON_MUTEX[] = L"Global\\LegionGoControlSingletonMutex";
 constexpr wchar_t BACKEND_MUTEX[] = L"Global\\LegionGoControlBackendMutex";
 
 constexpr UINT WMAPP_TRAY = WM_APP + 100;
 constexpr UINT WMAPP_SHOW_SETTINGS = WM_APP + 101;
 constexpr UINT WMAPP_WORKER_UPDATE = WM_APP + 102;
+constexpr UINT WMAPP_FAN_CURVE_CHANGED = WM_APP + 103;
+constexpr UINT_PTR FAN_TIMER_ID = 1;
 
 constexpr UINT ID_TRAY_SETTINGS = 40001;
 constexpr UINT ID_TRAY_PROFILES = 40002;
@@ -101,6 +107,14 @@ constexpr int IDC_MANAGE_PROFILES = 5070;
 constexpr int IDC_TDP_STATUS = 5071;
 constexpr int IDC_INFO_REPOSITORY = 5080;
 constexpr int IDC_INFO_ICON_LICENSE = 5081;
+constexpr int IDC_FAN_ENABLE = 5090;
+constexpr int IDC_FAN_CURVE = 5091;
+constexpr int IDC_FAN_STATUS = 5092;
+constexpr int IDC_FAN_POINT = 5093;
+constexpr int IDC_FAN_DUTY = 5094;
+constexpr int IDC_FAN_DUTY_SPIN = 5095;
+constexpr int IDC_FAN_APPLY = 5096;
+constexpr int IDC_FAN_RESTORE = 5097;
 constexpr int IDC_PROFILE_LIST = 5100;
 constexpr int IDC_PROFILE_ADD = 5101;
 constexpr int IDC_PROFILE_EDIT = 5102;
@@ -138,11 +152,14 @@ std::wstring g_logPath;
 std::wstring g_backendPath;
 std::wstring g_tdpStatePath;
 std::wstring g_batteryStatePath;
+std::wstring g_fanStatePath;
 
 std::atomic_bool g_logging{false};
 int g_debounceMs = 40;
 int g_actionCooldownMs = 250;
 LegionGoCore::TdpTriple g_baseTdp{16, 20, 20};
+bool g_fanEnabled = false;
+LegionGoCore::FanCurve g_fanCurve{{44,48,48,51,51,55,60,71,87,87}};
 
 std::wstring Trim(const std::wstring& value) {
     std::size_t first = 0;
@@ -187,6 +204,7 @@ void InitializePaths() {
     g_backendPath = g_baseDir + L"\\LegionGoNativeWmiProbe.exe";
     g_tdpStatePath = g_baseDir + L"\\LegionGoNativeWmiProbe_state.txt";
     g_batteryStatePath = g_baseDir + L"\\LegionGoBatteryLimitState.txt";
+    g_fanStatePath = g_baseDir + L"\\LegionGoFanState.txt";
 }
 
 std::wstring NowText() {
@@ -229,6 +247,10 @@ void CreateDefaultConfiguration() {
     IniWriteInt(L"TDP", L"BaseStapmW", 16);
     IniWriteInt(L"TDP", L"BaseFastW", 20);
     IniWriteInt(L"TDP", L"BaseSlowW", 20);
+    IniWriteInt(L"Fan", L"Enabled", 0);
+    const int fanDefaults[] = {44,48,48,51,51,55,60,71,87,87};
+    for (int index = 0; index < 10; ++index)
+        IniWriteInt(L"Fan", (L"Duty" + std::to_wstring(index)).c_str(), fanDefaults[index]);
 
     struct DefaultButton { const wchar_t* name; int enabled; const wchar_t* action; const wchar_t* valueKey; const wchar_t* value; };
     const DefaultButton defaults[] = {
@@ -356,6 +378,36 @@ BatteryStatus ReadBatteryState() {
     return result;
 }
 
+struct FanStatus {
+    bool known = false;
+    bool backupActive = false;
+    int rpm = 0;
+    int temperatureC = 0;
+    int fullSpeed = 0;
+    LegionGoCore::FanCurve curve{};
+    std::wstring error;
+};
+FanStatus ReadFanState() {
+    FanStatus result; std::wstring text;
+    if (!ReadUtf16File(g_fanStatePath, text)) { result.error = L"Fan telemetry unavailable"; return result; }
+    result.known = Upper(Field(text, L"Known")) == L"TRUE";
+    result.backupActive = Upper(Field(text, L"BackupActive")) == L"TRUE";
+    if (!result.known) { result.error = Field(text, L"Error"); return result; }
+    auto readInteger = [&](const std::wstring& key, int& value) {
+        const std::wstring field = Field(text, key); if (field.empty()) return false;
+        wchar_t* end = nullptr; const long parsed = wcstol(field.c_str(), &end, 10);
+        if (!end || *end) return false; value = static_cast<int>(parsed); return true;
+    };
+    if (!readInteger(L"Rpm", result.rpm) || !readInteger(L"TemperatureC", result.temperatureC) ||
+        !readInteger(L"FullSpeed", result.fullSpeed)) { result.known = false; result.error = L"Incomplete fan telemetry"; return result; }
+    for (std::size_t index = 0; index < LegionGoCore::kFanPointCount; ++index)
+        if (!readInteger(L"Speed" + std::to_wstring(index), result.curve.dutyPercent[index])) {
+            result.known = false; result.error = L"Incomplete fan curve read-back"; return result;
+        }
+    if (!LegionGoCore::ValidateFanCurve(result.curve, &result.error)) result.known = false;
+    return result;
+}
+
 bool RunBackend(const std::wstring& arguments, DWORD& exitCode, DWORD timeout = 7000) {
     static std::mutex inProcessBackendMutex;
     std::lock_guard<std::mutex> localLock(inProcessBackendMutex);
@@ -411,6 +463,14 @@ bool BackendSetTdp(const LegionGoCore::TdpTriple& value, DWORD& code) {
     // the backend mutex: another instance may legitimately be reading it.
     return RunBackend(L"set " + std::to_wstring(value.stapm) + L" " +
                       std::to_wstring(value.fast) + L" " + std::to_wstring(value.slow), code) && code == 0;
+}
+bool BackendSetFan(const LegionGoCore::FanCurve& curve, DWORD& code) {
+    std::wstring arguments = L"fan-set";
+    for (const int duty : curve.dutyPercent) arguments += L" " + std::to_wstring(duty);
+    return RunBackend(arguments, code, 30000) && code == 0;
+}
+bool BackendFanCommand(const wchar_t* command, DWORD& code) {
+    return RunBackend(command, code, 30000) && code == 0;
 }
 
 std::wstring HResultText(HRESULT value) {
@@ -661,6 +721,13 @@ void LoadConfiguration() {
         IniInt(L"TDP", L"BaseSlowW", IniInt(L"General", L"BaseSlowW", IniInt(L"TDP", L"CustomSlowW", 20)))};
     base = LegionGoCore::NormalizeTdpHierarchy(base);
     if (!LegionGoCore::ValidateTdpTriple(base)) base = {16, 20, 20};
+    LegionGoCore::FanCurve fanCurve;
+    const int fanFallbacks[] = {44,48,48,51,51,55,60,71,87,87};
+    for (std::size_t index = 0; index < LegionGoCore::kFanPointCount; ++index)
+        fanCurve.dutyPercent[index] = IniInt(L"Fan", (L"Duty" + std::to_wstring(index)).c_str(), fanFallbacks[index]);
+    if (!LegionGoCore::ValidateFanCurve(fanCurve))
+        fanCurve = LegionGoCore::FanCurve{{44,48,48,51,51,55,60,71,87,87}};
+    const bool fanEnabled = IniInt(L"Fan", L"Enabled", 0) != 0;
     if (g_buttons.empty()) InitializeButtons();
     for (auto& button : g_buttons) {
         const bool pressed = button.pressed;
@@ -674,6 +741,8 @@ void LoadConfiguration() {
     const auto profiles = LoadProfilesFromIni();
     std::lock_guard<std::mutex> lock(g_configurationMutex);
     g_baseTdp = base;
+    g_fanCurve = fanCurve;
+    g_fanEnabled = fanEnabled;
     g_profiles = profiles;
 }
 
@@ -758,7 +827,7 @@ void HandleRawInput(HRAWINPUT input) {
 }
 
 // ---------- asynchronous profile/backend worker ----------
-enum class WorkerJob { Wake, BatteryStatus, BatteryToggle, BrightnessStatus, BrightnessSet };
+enum class WorkerJob { Wake, BatteryStatus, BatteryToggle, BrightnessStatus, BrightnessSet, FanStatus, FanApply, FanRestore, FanRecover };
 struct RuntimeStatus {
     bool profileActive = false;
     std::wstring profileId, profileName;
@@ -774,6 +843,9 @@ struct RuntimeStatus {
     std::wstring brightnessError;
     unsigned brightnessSetSequence = 0;
     bool brightnessSetOk = true;
+    FanStatus fan;
+    unsigned fanOperationSequence = 0;
+    bool fanOperationOk = true;
 };
 std::mutex g_workerMutex;
 std::condition_variable g_workerCondition;
@@ -859,6 +931,20 @@ void WorkerMain() {
                 status.brightnessError = ok ? L"" : error;
                 if (job == WorkerJob::BrightnessSet) { ++status.brightnessSetSequence; status.brightnessSetOk = ok; }
                 if (!ok) LogAlways(L"Brightness operation failed: " + error);
+            } else if (job == WorkerJob::FanStatus || job == WorkerJob::FanApply || job == WorkerJob::FanRestore || job == WorkerJob::FanRecover) {
+                DWORD code = 0; bool ok = false;
+                if (job == WorkerJob::FanApply) {
+                    LegionGoCore::FanCurve curve;
+                    { std::lock_guard<std::mutex> lock(g_configurationMutex); curve = g_fanCurve; }
+                    ok = BackendSetFan(curve, code);
+                } else {
+                    ok = BackendFanCommand((job == WorkerJob::FanRestore || job == WorkerJob::FanRecover) ? L"fan-restore" : L"fan-status", code);
+                }
+                status.fan = ReadFanState();
+                if (job != WorkerJob::FanStatus && job != WorkerJob::FanRecover) {
+                    ++status.fanOperationSequence; status.fanOperationOk = ok;
+                }
+                if (!ok) LogAlways(L"Fan backend failed, code=" + std::to_wstring(code) + L" " + status.fan.error);
             }
         }
         if (stopRequested) break;
@@ -911,11 +997,14 @@ void WorkerMain() {
         }
         PublishRuntime(status);
     }
-    // Always make the configured base the final clean-shutdown target.  This
-    // also covers a profile transition occurring concurrently with shutdown.
+    // Restore fan state first and always: a crash-recovery backup can remain
+    // active even when the desired INI preference has already been disabled.
+    DWORD code = 0;
+    if (!BackendFanCommand(L"fan-restore", code))
+        LogAlways(L"Fan curve restore failed during shutdown; code=" + std::to_wstring(code));
+    // Always make the configured base the final clean-shutdown TDP target.
     LegionGoCore::TdpTriple base;
     { std::lock_guard<std::mutex> lock(g_configurationMutex); base = g_baseTdp; }
-    DWORD code = 0;
     bool restored = BackendSetTdp(base, code);
     if (!restored) restored = BackendSetTdp(base, code);
     if (!restored) LogAlways(L"Base TDP restore failed during shutdown; code=" + std::to_wstring(code));
@@ -927,15 +1016,16 @@ void QueueWorker(WorkerJob job) {
         if (g_workerStop) return;
         // Slider movement can emit many notifications. Keep at most one queued
         // brightness write; it always consumes the latest atomic value.
-        if (job != WorkerJob::BrightnessSet ||
-            std::find(g_workerJobs.begin(), g_workerJobs.end(), WorkerJob::BrightnessSet) == g_workerJobs.end())
+        const bool coalesced = job == WorkerJob::BrightnessSet || job == WorkerJob::FanStatus || job == WorkerJob::FanApply;
+        if (!coalesced || std::find(g_workerJobs.begin(), g_workerJobs.end(), job) == g_workerJobs.end())
             g_workerJobs.push_back(job);
     }
     g_workerCondition.notify_one();
 }
 void StartWorker() {
     { std::lock_guard<std::mutex> lock(g_workerMutex); g_workerStop = false;
-      g_workerJobs.push_back(WorkerJob::BatteryStatus); g_workerJobs.push_back(WorkerJob::BrightnessStatus); }
+      g_workerJobs.push_back(WorkerJob::BatteryStatus); g_workerJobs.push_back(WorkerJob::BrightnessStatus);
+      g_workerJobs.push_back(g_fanEnabled ? WorkerJob::FanApply : WorkerJob::FanRecover); }
     g_worker = std::thread(WorkerMain);
 }
 void StopWorker() {
@@ -997,16 +1087,20 @@ void CenterWindow(HWND window, HWND owner) {
     SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 }
 
+constexpr int SETTINGS_PAGE_COUNT = 5;
 struct SettingsState {
-    int tab = 0, selectedButton = 0;
+    int tab = 0, selectedButton = 0, selectedFanPoint = 4;
     bool loading = false;
     bool startup = false;
     bool normalizingTdp = false;
+    bool normalizingFan = false;
     bool brightnessDragging = false;
+    bool fanEnabled = false;
     int debounce = 40, cooldown = 250;
     LegionGoCore::TdpTriple base;
+    LegionGoCore::FanCurve fanDraft{{44,48,48,51,51,55,60,71,87,87}};
     std::vector<ButtonBinding> buttons;
-    std::vector<HWND> pages[4];
+    std::vector<HWND> pages[SETTINGS_PAGE_COUNT];
 };
 SettingsState* SettingsData(HWND hwnd) { return reinterpret_cast<SettingsState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)); }
 void PageControl(SettingsState& state, int page, HWND control) { state.pages[page].push_back(control); }
@@ -1019,10 +1113,139 @@ HWND PageField(SettingsState& state, int page, HWND parent, const wchar_t* cls, 
 }
 void ShowSettingsPage(HWND hwnd, int page) {
     SettingsState* state = SettingsData(hwnd); if (!state) return;
-    state->tab = (std::max)(0, (std::min)(3, page));
+    state->tab = (std::max)(0, (std::min)(SETTINGS_PAGE_COUNT - 1, page));
     TabCtrl_SetCurSel(GetDlgItem(hwnd, IDC_TAB), state->tab);
-    for (int index = 0; index < 4; ++index) for (HWND control : state->pages[index]) ShowWindow(control, index == state->tab ? SW_SHOW : SW_HIDE);
+    for (int index = 0; index < SETTINGS_PAGE_COUNT; ++index) for (HWND control : state->pages[index]) ShowWindow(control, index == state->tab ? SW_SHOW : SW_HIDE);
 }
+
+void UpdateFanPointEditor(HWND hwnd) {
+    SettingsState* state = SettingsData(hwnd); if (!state) return;
+    const int index = state->selectedFanPoint;
+    SetText(hwnd, IDC_FAN_POINT, L"Node " + std::to_wstring(index + 1) + L": " +
+        std::to_wstring(LegionGoCore::kFanTemperaturesC[static_cast<size_t>(index)]) + L" C");
+    state->normalizingFan = true;
+    SetNumericValue(hwnd, IDC_FAN_DUTY, IDC_FAN_DUTY_SPIN, state->fanDraft.dutyPercent[static_cast<size_t>(index)]);
+    state->normalizingFan = false;
+}
+
+int FanDutyFloor(int index) {
+    if (index == 7) return 60;
+    if (index == 8) return 80;
+    if (index == 9) return 85;
+    return 20;
+}
+
+LRESULT CALLBACK FanCurveProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto data = [&]() -> SettingsState* { return SettingsData(GetParent(hwnd)); };
+    auto graphRect = [&](RECT client) {
+        RECT graph{client.left + DpiScale(hwnd, 54), client.top + DpiScale(hwnd, 18),
+                   client.right - DpiScale(hwnd, 24), client.bottom - DpiScale(hwnd, 42)};
+        return graph;
+    };
+    auto pointPosition = [&](const RECT& graph, int index, int duty) {
+        POINT point{};
+        point.x = graph.left + MulDiv(LegionGoCore::kFanTemperaturesC[static_cast<size_t>(index)] - 10,
+                                     graph.right - graph.left, 90);
+        point.y = graph.bottom - MulDiv(duty - 20, graph.bottom - graph.top, 80);
+        return point;
+    };
+    switch (message) {
+        case WM_ERASEBKGND: return 1;
+        case WM_GETDLGCODE: return DLGC_WANTARROWS | DLGC_WANTCHARS;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{}; HDC target = BeginPaint(hwnd, &paint); RECT client{}; GetClientRect(hwnd, &client);
+            HDC dc = CreateCompatibleDC(target); HBITMAP bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+            HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+            HBRUSH background = CreateSolidBrush(RGB(247,248,250)); FillRect(dc, &client, background); DeleteObject(background);
+            RECT graph = graphRect(client); HBRUSH graphBrush = CreateSolidBrush(RGB(31,36,43)); FillRect(dc, &graph, graphBrush); DeleteObject(graphBrush);
+            SetBkMode(dc, TRANSPARENT); SelectObject(dc, g_font);
+            SetTextColor(dc, RGB(70,74,80));
+            RECT axisTitle{graph.left, client.top, graph.right, graph.top};
+            DrawTextW(dc, L"Fan duty % / estimated RPM", -1, &axisTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            HPEN grid = CreatePen(PS_SOLID, 1, RGB(74,81,91)); HGDIOBJ oldPen = SelectObject(dc, grid);
+            SetTextColor(dc, RGB(70,74,80));
+            for (int duty = 20; duty <= 100; duty += 20) {
+                const int y = graph.bottom - MulDiv(duty - 20, graph.bottom - graph.top, 80);
+                MoveToEx(dc, graph.left, y, nullptr); LineTo(dc, graph.right, y);
+                RECT label{client.left, y - 10, graph.left - 6, y + 10};
+                const std::wstring text = std::to_wstring(duty) + L"%"; DrawTextW(dc, text.c_str(), -1, &label, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            }
+            for (int index = 0; index < 10; ++index) {
+                const int x = graph.left + MulDiv(index, graph.right - graph.left, 9);
+                MoveToEx(dc, x, graph.top, nullptr); LineTo(dc, x, graph.bottom);
+                RECT label{x - 22, graph.bottom + 5, x + 22, client.bottom};
+                const std::wstring text = std::to_wstring((index + 1) * 10) + L"C"; DrawTextW(dc, text.c_str(), -1, &label, DT_CENTER | DT_TOP | DT_SINGLELINE);
+            }
+            DeleteObject(SelectObject(dc, oldPen));
+            SettingsState* state = data();
+            if (state) {
+                HPEN curvePen = CreatePen(PS_SOLID, DpiScale(hwnd, 3), RGB(65,174,255)); oldPen = SelectObject(dc, curvePen);
+                for (int index = 0; index < 10; ++index) {
+                    const POINT point = pointPosition(graph, index, state->fanDraft.dutyPercent[static_cast<size_t>(index)]);
+                    if (index == 0) MoveToEx(dc, point.x, point.y, nullptr); else LineTo(dc, point.x, point.y);
+                }
+                DeleteObject(SelectObject(dc, oldPen));
+                for (int index = 0; index < 10; ++index) {
+                    const int duty = state->fanDraft.dutyPercent[static_cast<size_t>(index)]; const POINT point = pointPosition(graph, index, duty);
+                    const int radius = DpiScale(hwnd, index == state->selectedFanPoint ? 7 : 5);
+                    HBRUSH node = CreateSolidBrush(index == state->selectedFanPoint ? RGB(255,166,61) : RGB(65,174,255));
+                    HBRUSH old = static_cast<HBRUSH>(SelectObject(dc, node)); Ellipse(dc, point.x-radius, point.y-radius, point.x+radius, point.y+radius);
+                    SelectObject(dc, old); DeleteObject(node);
+                    SetTextColor(dc, RGB(238,242,247)); RECT value{point.x-34, point.y-38, point.x+34, point.y-7};
+                    const std::wstring label = std::to_wstring(duty) + L"%\r\n~" + std::to_wstring(LegionGoCore::EstimateFanRpm(duty)) + L" RPM";
+                    DrawTextW(dc, label.c_str(), -1, &value, DT_CENTER);
+                }
+                const RuntimeStatus runtime = RuntimeSnapshot();
+                if (runtime.fan.known) {
+                    const int clampedTemperature = (std::max)(10, (std::min)(100, runtime.fan.temperatureC));
+                    const int x = graph.left + MulDiv(clampedTemperature - 10, static_cast<int>(graph.right - graph.left), 90);
+                    HPEN marker = CreatePen(PS_DOT, 1, RGB(255,93,93)); oldPen = SelectObject(dc, marker);
+                    MoveToEx(dc, x, graph.top, nullptr); LineTo(dc, x, graph.bottom); DeleteObject(SelectObject(dc, oldPen));
+                }
+            }
+            BitBlt(target, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+            SelectObject(dc, oldBitmap); DeleteObject(bitmap); DeleteDC(dc); EndPaint(hwnd, &paint); return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            SettingsState* state = data(); if (!state) return 0; SetFocus(hwnd);
+            RECT client{}, graph{}; GetClientRect(hwnd, &client); graph = graphRect(client);
+            const POINT mouse{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; int best = -1, distance = INT_MAX;
+            for (int index = 0; index < 10; ++index) {
+                POINT point = pointPosition(graph, index, state->fanDraft.dutyPercent[static_cast<size_t>(index)]);
+                const int value = abs(point.x-mouse.x) + abs(point.y-mouse.y); if (value < distance) { distance=value; best=index; }
+            }
+            if (best >= 0 && distance <= DpiScale(hwnd, 28)) { state->selectedFanPoint=best; SetCapture(hwnd); UpdateFanPointEditor(GetParent(hwnd)); InvalidateRect(hwnd,nullptr,FALSE); }
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            if (GetCapture() != hwnd) return 0; SettingsState* state = data(); if (!state) return 0;
+            RECT client{}, graph{}; GetClientRect(hwnd,&client); graph=graphRect(client);
+            const int index=state->selectedFanPoint; const int y=GET_Y_LPARAM(lParam);
+            const int graphHeight = (std::max)(1, static_cast<int>(graph.bottom - graph.top));
+            int duty = 20 + MulDiv(static_cast<int>(graph.bottom) - y, 80, graphHeight);
+            const int lower=(std::max)(FanDutyFloor(index), index ? state->fanDraft.dutyPercent[static_cast<size_t>(index-1)] : 20);
+            const int upper=index<9 ? state->fanDraft.dutyPercent[static_cast<size_t>(index+1)] : 100;
+            duty=(std::max)(lower,(std::min)(upper,duty)); state->fanDraft.dutyPercent[static_cast<size_t>(index)]=duty;
+            UpdateFanPointEditor(GetParent(hwnd)); InvalidateRect(hwnd,nullptr,FALSE); PostMessageW(GetParent(hwnd),WMAPP_FAN_CURVE_CHANGED,0,0); return 0;
+        }
+        case WM_LBUTTONUP: if (GetCapture()==hwnd) ReleaseCapture(); return 0;
+        case WM_KEYDOWN: {
+            SettingsState* state=data(); if(!state) return 0;
+            if (wParam == VK_LEFT || wParam == VK_RIGHT) {
+                state->selectedFanPoint = (std::max)(0, (std::min)(9, state->selectedFanPoint + (wParam == VK_RIGHT ? 1 : -1)));
+                UpdateFanPointEditor(GetParent(hwnd)); InvalidateRect(hwnd, nullptr, FALSE); return 0;
+            }
+            if (wParam!=VK_UP && wParam!=VK_DOWN) return 0;
+            const int index=state->selectedFanPoint; int value=state->fanDraft.dutyPercent[static_cast<size_t>(index)]+(wParam==VK_UP?1:-1);
+            const int lower=(std::max)(FanDutyFloor(index),index?state->fanDraft.dutyPercent[static_cast<size_t>(index-1)]:20);
+            const int upper=index<9?state->fanDraft.dutyPercent[static_cast<size_t>(index+1)]:100;
+            state->fanDraft.dutyPercent[static_cast<size_t>(index)]=(std::max)(lower,(std::min)(upper,value));
+            UpdateFanPointEditor(GetParent(hwnd));InvalidateRect(hwnd,nullptr,FALSE);return 0;
+        }
+        default: return DefWindowProcW(hwnd,message,wParam,lParam);
+    }
+}
+
 void UpdateControllerActionFields(HWND hwnd) {
     const LRESULT selection = SendDlgItemMessageW(hwnd, IDC_BUTTON_ACTION, CB_GETCURSEL, 0, 0);
     const ActionType action = selection >= 0 && selection <= 3 ? static_cast<ActionType>(selection) : ActionType::None;
@@ -1079,7 +1302,7 @@ void PopulateSettings(HWND hwnd) {
     LoadConfiguration();
     state->loading = true; state->buttons = g_buttons; state->selectedButton = 0;
     state->debounce = g_debounceMs; state->cooldown = g_actionCooldownMs;
-    { std::lock_guard<std::mutex> lock(g_configurationMutex); state->base = g_baseTdp; }
+    { std::lock_guard<std::mutex> lock(g_configurationMutex); state->base = g_baseTdp; state->fanDraft = g_fanCurve; state->fanEnabled = g_fanEnabled; }
     state->startup = IsStartupEnabled();
     SendDlgItemMessageW(hwnd, IDC_LOGGING, BM_SETCHECK, g_logging.load() ? BST_CHECKED : BST_UNCHECKED, 0);
     SendDlgItemMessageW(hwnd, IDC_STARTUP, BM_SETCHECK, state->startup ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1091,6 +1314,8 @@ void PopulateSettings(HWND hwnd) {
     SetNumericValue(hwnd, IDC_BASE_STAPM, IDC_BASE_STAPM_SPIN, state->base.stapm);
     SetNumericValue(hwnd, IDC_BASE_FAST, IDC_BASE_FAST_SPIN, state->base.fast);
     SetNumericValue(hwnd, IDC_BASE_SLOW, IDC_BASE_SLOW_SPIN, state->base.slow);
+    SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_SETCHECK, state->fanEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    UpdateFanPointEditor(hwnd); InvalidateRect(GetDlgItem(hwnd, IDC_FAN_CURVE), nullptr, FALSE);
     state->loading = false; LoadControllerEditor(hwnd);
 }
 bool ApplySettings(HWND hwnd) {
@@ -1110,6 +1335,14 @@ bool ApplySettings(HWND hwnd) {
     }
     std::wstring error;
     if (!LegionGoCore::ValidateTdpTriple(base, &error)) { Message(hwnd, L"Settings", error, MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 2); return false; }
+    int selectedFanDuty = 0;
+    if (!ParseInteger(hwnd, IDC_FAN_DUTY, selectedFanDuty) || selectedFanDuty < 20 || selectedFanDuty > 100) {
+        Message(hwnd, L"Fan curve", L"Fan duty must be a whole percentage between 20 and 100.", MB_OK | MB_ICONERROR);
+        ShowSettingsPage(hwnd, 3); return false;
+    }
+    state->fanDraft.dutyPercent[static_cast<size_t>(state->selectedFanPoint)] = selectedFanDuty;
+    if (!LegionGoCore::ValidateFanCurve(state->fanDraft, &error)) { Message(hwnd, L"Fan curve", error, MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 3); return false; }
+    const bool fanEnabled = SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const bool logging = SendDlgItemMessageW(hwnd, IDC_LOGGING, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const bool startup = SendDlgItemMessageW(hwnd, IDC_STARTUP, BM_GETCHECK, 0, 0) == BST_CHECKED;
     if (startup != state->startup && !SetStartupEnabled(startup)) {
@@ -1118,6 +1351,9 @@ bool ApplySettings(HWND hwnd) {
     IniWriteInt(L"General", L"logging", logging ? 1 : 0); IniWriteInt(L"General", L"debounce_ms", debounce);
     IniWriteInt(L"General", L"action_cooldown_ms", cooldown); IniWriteInt(L"TDP", L"BaseStapmW", base.stapm);
     IniWriteInt(L"TDP", L"BaseFastW", base.fast); IniWriteInt(L"TDP", L"BaseSlowW", base.slow);
+    IniWriteInt(L"Fan", L"Enabled", fanEnabled ? 1 : 0);
+    for (std::size_t index = 0; index < LegionGoCore::kFanPointCount; ++index)
+        IniWriteInt(L"Fan", (L"Duty" + std::to_wstring(index)).c_str(), state->fanDraft.dutyPercent[index]);
     for (const auto& button : state->buttons) {
         IniWriteInt(button.name.c_str(), L"enabled", button.enabled ? 1 : 0);
         IniWrite(button.name.c_str(), L"trigger", button.triggerDown ? L"down" : L"up");
@@ -1128,15 +1364,17 @@ bool ApplySettings(HWND hwnd) {
     }
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
     state->startup = startup; state->base = base; state->debounce = debounce; state->cooldown = cooldown;
-    LoadConfiguration(); QueueWorker(WorkerJob::Wake); Balloon(L"Settings applied."); return true;
+    LoadConfiguration(); QueueWorker(fanEnabled ? WorkerJob::FanApply : WorkerJob::FanRestore);
+    QueueWorker(WorkerJob::Wake); Balloon(L"Settings applied."); return true;
 }
 
 void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     HWND tab = Control(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP | TCS_FIXEDWIDTH | TCS_OWNERDRAWFIXED, 12, 12, 876, 548, IDC_TAB);
     TCITEMW item{}; item.mask = TCIF_TEXT;
-    wchar_t general[] = L"General", controller[] = L"Controller", tdp[] = L"TDP", info[] = L"Info";
+    wchar_t general[] = L"General", controller[] = L"Controller", tdp[] = L"TDP", fan[] = L"Fan", info[] = L"Info";
     item.pszText = general; TabCtrl_InsertItem(tab, 0, &item); item.pszText = controller; TabCtrl_InsertItem(tab, 1, &item);
-    item.pszText = tdp; TabCtrl_InsertItem(tab, 2, &item); item.pszText = info; TabCtrl_InsertItem(tab, 3, &item);
+    item.pszText = tdp; TabCtrl_InsertItem(tab, 2, &item); item.pszText = fan; TabCtrl_InsertItem(tab, 3, &item);
+    item.pszText = info; TabCtrl_InsertItem(tab, 4, &item);
     TabCtrl_SetItemSize(tab, DpiScale(hwnd, 150), DpiScale(hwnd, 32));
     Control(hwnd, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 638, 578, 76, 32, IDC_OK);
     Control(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 722, 578, 76, 32, IDC_CANCEL);
@@ -1198,19 +1436,33 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     PageField(state, 2, hwnd, L"BUTTON", L"Manage game profiles...", BS_PUSHBUTTON, x, y + 205, 190, 30, IDC_MANAGE_PROFILES);
     PageField(state, 2, hwnd, L"STATIC", L"", SS_LEFT, x, y + 260, 790, 45, IDC_TDP_STATUS);
 
-    Label(state, 3, hwnd, APP_VERSION, x, y, 760, 30);
-    Label(state, 3, hwnd,
-          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, and automatically applies per-application TDP profiles while following launcher child processes.",
+    PageField(state, 3, hwnd, L"BUTTON", L"Enable custom firmware fan curve", BS_AUTOCHECKBOX | WS_TABSTOP,
+              x, y, 280, 26, IDC_FAN_ENABLE);
+    PageField(state, 3, hwnd, L"STATIC", L"Reading fan telemetry...", SS_LEFT, x + 300, y + 2, 500, 28, IDC_FAN_STATUS);
+    Label(state, 3, hwnd, L"Drag nodes vertically or select one and use the numeric control. Temperature breakpoints are fixed by Legion Go firmware.", x, y + 35, 800, 24);
+    PageField(state, 3, hwnd, FAN_CURVE_CLASS, L"", WS_TABSTOP | WS_BORDER, x, y + 63, 800, 330, IDC_FAN_CURVE, WS_EX_CLIENTEDGE);
+    PageField(state, 3, hwnd, L"STATIC", L"Node", SS_LEFT, x, y + 410, 125, 24, IDC_FAN_POINT);
+    HWND fanDuty = PageField(state, 3, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 130, y + 405, 65, 27, IDC_FAN_DUTY, WS_EX_CLIENTEDGE);
+    HWND fanDutySpin = PageField(state, 3, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 197, y + 405, 22, 27, IDC_FAN_DUTY_SPIN);
+    ConfigureSpinner(fanDutySpin, fanDuty, 20, 100);
+    Label(state, 3, hwnd, L"% duty (estimated RPM shown on graph)", x + 230, y + 410, 280, 24);
+    PageField(state, 3, hwnd, L"BUTTON", L"Apply curve now", BS_PUSHBUTTON | WS_TABSTOP, x + 540, y + 402, 125, 32, IDC_FAN_APPLY);
+    PageField(state, 3, hwnd, L"BUTTON", L"Restore firmware curve", BS_PUSHBUTTON | WS_TABSTOP, x + 675, y + 402, 150, 32, IDC_FAN_RESTORE);
+    Label(state, 3, hwnd, L"Safety floors: 80 C >= 60%, 90 C >= 80%, 100 C >= 85%. Firmware emergency protection always has priority.", x, y + 452, 800, 30);
+
+    Label(state, 4, hwnd, APP_VERSION, x, y, 760, 30);
+    Label(state, 4, hwnd,
+          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, custom fan curves, and automatically applies per-application TDP profiles while following launcher child processes.",
           x, y + 48, 790, 100);
-    Label(state, 3, hwnd, L"Repository:", x, y + 175, 120, 24);
-    PageField(state, 3, hwnd, L"BUTTON", L"Open GitHub repository", BS_PUSHBUTTON | WS_TABSTOP,
+    Label(state, 4, hwnd, L"Repository:", x, y + 175, 120, 24);
+    PageField(state, 4, hwnd, L"BUTTON", L"Open GitHub repository", BS_PUSHBUTTON | WS_TABSTOP,
               x, y + 205, 210, 34, IDC_INFO_REPOSITORY);
-    Label(state, 3, hwnd, REPOSITORY_URL, x + 230, y + 212, 540, 24);
-    Label(state, 3, hwnd, L"Application icon: Nintendo Switch by Nick Taras from The Noun Project (Creative Commons, attribution required).", x, y + 270, 790, 45);
-    PageField(state, 3, hwnd, L"BUTTON", L"Open icon and license page", BS_PUSHBUTTON | WS_TABSTOP,
+    Label(state, 4, hwnd, REPOSITORY_URL, x + 230, y + 212, 540, 24);
+    Label(state, 4, hwnd, L"Application icon: Nintendo Switch by Nick Taras from The Noun Project (Creative Commons, attribution required).", x, y + 270, 790, 45);
+    PageField(state, 4, hwnd, L"BUTTON", L"Open icon and license page", BS_PUSHBUTTON | WS_TABSTOP,
               x, y + 320, 230, 34, IDC_INFO_ICON_LICENSE);
-    Label(state, 3, hwnd,
-          L"This beta is hardware-specific. TDP, battery, HID and restore behavior must be validated on the actual Legion Go device.",
+    Label(state, 4, hwnd,
+          L"This beta is hardware-specific. TDP, battery, HID, fan and restore behavior must be validated on the actual Legion Go device.",
           x, y + 390, 790, 55);
     ShowSettingsPage(hwnd, 0);
 }
@@ -1224,8 +1476,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         }
         case WM_NOTIFY: {
             const NMHDR* header = reinterpret_cast<NMHDR*>(lParam);
-            if (header && header->idFrom == IDC_TAB && header->code == TCN_SELCHANGE)
-                ShowSettingsPage(hwnd, TabCtrl_GetCurSel(header->hwndFrom));
+            if (header && header->idFrom == IDC_TAB && header->code == TCN_SELCHANGE) {
+                const int page = TabCtrl_GetCurSel(header->hwndFrom); ShowSettingsPage(hwnd, page);
+                if (page == 3) QueueWorker(WorkerJob::FanStatus);
+            }
             return 0;
         }
         case WM_DRAWITEM: {
@@ -1258,6 +1512,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
         }
+        case WMAPP_FAN_CURVE_CHANGED: return 0;
         case WM_COMMAND: {
             const int id = LOWORD(wParam), notification = HIWORD(wParam); SettingsState* state = SettingsData(hwnd); if (!state) return 0;
             if (id == IDC_OK) { if (ApplySettings(hwnd)) ShowWindow(hwnd, SW_HIDE); }
@@ -1270,6 +1525,21 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                 EnableWindow(GetDlgItem(hwnd, IDC_BATTERY), FALSE);
                 SetText(hwnd, IDC_BATTERY_STATUS, L"Applying and verifying...");
                 QueueWorker(WorkerJob::BatteryToggle);
+            } else if (id == IDC_FAN_DUTY && notification == EN_CHANGE && !state->loading && !state->normalizingFan) {
+                int value = 0;
+                if (ParseInteger(hwnd, IDC_FAN_DUTY, value) && value >= 20 && value <= 100) {
+                    const int index = state->selectedFanPoint;
+                    const int lower = (std::max)(FanDutyFloor(index), index ? state->fanDraft.dutyPercent[static_cast<size_t>(index-1)] : 20);
+                    const int upper = index < 9 ? state->fanDraft.dutyPercent[static_cast<size_t>(index+1)] : 100;
+                    value = (std::max)(lower, (std::min)(upper, value));
+                    state->fanDraft.dutyPercent[static_cast<size_t>(index)] = value;
+                    state->normalizingFan = true; SetNumericValue(hwnd, IDC_FAN_DUTY, IDC_FAN_DUTY_SPIN, value); state->normalizingFan = false;
+                    InvalidateRect(GetDlgItem(hwnd, IDC_FAN_CURVE), nullptr, FALSE);
+                }
+            } else if (id == IDC_FAN_APPLY) {
+                SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_SETCHECK, BST_CHECKED, 0); ApplySettings(hwnd);
+            } else if (id == IDC_FAN_RESTORE) {
+                SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_SETCHECK, BST_UNCHECKED, 0); ApplySettings(hwnd);
             }
             else if (id == IDC_BUTTON_SELECT && notification == CBN_SELCHANGE && !state->loading) {
                 StoreControllerEditor(hwnd); const int selected = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_BUTTON_SELECT, CB_GETCURSEL, 0, 0));
@@ -1325,6 +1595,12 @@ void UpdateSettingsRuntime() {
                 status.brightnessKnown ? std::to_wstring(status.brightness) + L"%"
                                        : (status.brightnessError.empty() ? L"Unavailable" : L"Set failed - see log"));
     }
+    if (status.fan.known) {
+        const int command = LegionGoCore::InterpolateFanDuty(status.fan.curve, status.fan.temperatureC);
+        SetText(g_settings, IDC_FAN_STATUS, L"CPU " + std::to_wstring(status.fan.temperatureC) + L" C  |  Fan " +
+            std::to_wstring(status.fan.rpm) + L" RPM  |  Curve command ~" + std::to_wstring(command) + L"%");
+    } else SetText(g_settings, IDC_FAN_STATUS, status.fan.error.empty() ? L"Fan telemetry unavailable" : status.fan.error);
+    InvalidateRect(GetDlgItem(g_settings, IDC_FAN_CURVE), nullptr, FALSE);
 }
 void ShowSettings(int tab) {
     if (!g_settings || !IsWindow(g_settings)) {
@@ -1336,6 +1612,7 @@ void ShowSettings(int tab) {
     if (!g_settings) return;
     ShowSettingsPage(g_settings, tab); UpdateSettingsRuntime();
     if (tab == 0) { QueueWorker(WorkerJob::BatteryStatus); QueueWorker(WorkerJob::BrightnessStatus); }
+    if (tab == 3) QueueWorker(WorkerJob::FanStatus);
     ShowWindow(g_settings, SW_SHOWNORMAL); SetForegroundWindow(g_settings);
 }
 
@@ -1524,6 +1801,7 @@ bool AddTrayIcon(HWND hwnd) {
 }
 unsigned g_presentedBatteryToggleSequence = 0;
 unsigned g_presentedBrightnessSetSequence = 0;
+unsigned g_presentedFanOperationSequence = 0;
 void UpdateTrayTip() {
     const RuntimeStatus status = RuntimeSnapshot(); std::wstring tip = status.profileActive ? L"Active: " + status.profileName : L"Active: Base";
     tip += L" (STAPM " + std::to_wstring(status.desired.stapm) + L" / SLOW " +
@@ -1538,6 +1816,11 @@ void UpdateTrayTip() {
         g_presentedBrightnessSetSequence = status.brightnessSetSequence;
         if (!status.brightnessSetOk)
             Balloon(L"Screen brightness could not be changed. Details were written to LegionGoControl.log.", NIIF_ERROR);
+    }
+    if (status.fanOperationSequence != g_presentedFanOperationSequence) {
+        g_presentedFanOperationSequence = status.fanOperationSequence;
+        Balloon(status.fanOperationOk ? L"Fan curve operation verified." : L"Fan curve operation failed; see the log.",
+                status.fanOperationOk ? NIIF_INFO : NIIF_ERROR);
     }
 }
 void ShowTrayMenu(HWND hwnd) {
@@ -1572,12 +1855,19 @@ LRESULT CALLBACK HiddenProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             RAWINPUTDEVICE input{}; input.usUsagePage = 0xFFA0; input.usUsage = 0x0001; input.dwFlags = RIDEV_INPUTSINK; input.hwndTarget = hwnd;
             if (!RegisterRawInputDevices(&input, 1, sizeof(input))) LogAlways(L"Raw Input registration failed: " + std::to_wstring(GetLastError()));
             if (!AddTrayIcon(hwnd)) return -1;
+            SetTimer(hwnd, FAN_TIMER_ID, 1000, nullptr);
             return 0;
         }
         case WM_INPUT: HandleRawInput(reinterpret_cast<HRAWINPUT>(lParam)); return 0;
         case WM_COMMAND: TrayCommand(LOWORD(wParam)); return 0;
         case WMAPP_TRAY: { const UINT event = LOWORD(lParam); if (TrayMouseEvent(event) || TrayMouseEvent(static_cast<UINT>(lParam))) ShowTrayMenu(hwnd); return 0; }
         case WMAPP_SHOW_SETTINGS: ShowSettings(static_cast<int>(wParam)); return 0;
+        case WM_TIMER:
+            if (wParam == FAN_TIMER_ID && g_settings && IsWindowVisible(g_settings) && !IsIconic(g_settings)) {
+                SettingsState* settings = SettingsData(g_settings);
+                if (settings && settings->tab == 3) QueueWorker(WorkerJob::FanStatus);
+            }
+            return 0;
         case WMAPP_WORKER_UPDATE:
             UpdateTrayTip(); UpdateSettingsRuntime();
             if (g_profilesWindow && IsWindowVisible(g_profilesWindow)) FillProfileList(g_profilesWindow);
@@ -1587,7 +1877,7 @@ LRESULT CALLBACK HiddenProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             if (wParam) StopWorker();
             return 0;
         case WM_DESTROY:
-            StopWorker();
+            KillTimer(hwnd, FAN_TIMER_ID); StopWorker();
             if (g_settings && IsWindow(g_settings)) DestroyWindow(g_settings);
             if (g_profilesWindow && IsWindow(g_profilesWindow)) DestroyWindow(g_profilesWindow);
             Shell_NotifyIconW(NIM_DELETE, &g_nid); PostQuitMessage(0); return 0;
@@ -1631,6 +1921,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                                                  GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     RegisterWindowClass(HIDDEN_CLASS, HiddenProc, nullptr); RegisterWindowClass(SETTINGS_CLASS, SettingsProc);
     RegisterWindowClass(PROFILES_CLASS, ProfilesProc); RegisterWindowClass(PROFILE_EDITOR_CLASS, ProfileEditorProc);
+    RegisterWindowClass(FAN_CURVE_CLASS, FanCurveProc);
     g_icon = CreateTrayIcon();
     g_hidden = CreateWindowExW(0, HIDDEN_CLASS, APP_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 300, 200, nullptr, nullptr, instance, nullptr);
     if (!g_hidden) {
