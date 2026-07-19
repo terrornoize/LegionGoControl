@@ -26,9 +26,9 @@ Both executables must remain in the same directory.
 The V2 tray is intentionally small:
 
 - **Open TDP setter** — opens the TDP tab in Settings;
-- **Settings...** — opens General, Controller and TDP settings;
+- **Settings...** — opens General, Controller, TDP and Info settings;
 - **Game Profiles...** — manages per-executable TDP profiles;
-- active target status;
+- version header (`LegionGoControl v2 YYYYMMDD`) and active target status;
 - **Exit**.
 
 Startup, battery limit and logging were moved from the tray into **Settings > General**.
@@ -37,6 +37,7 @@ Startup, battery limit and logging were moved from the tray into **Settings > Ge
 
 ### General
 
+- Windows screen brightness slider (`0-100%`) through the standard `WmiMonitorBrightness` interface;
 - diagnostic logging;
 - HID debounce (`0-1000 ms`);
 - action cooldown (`50-5000 ms`);
@@ -63,12 +64,16 @@ For each button:
 
 M1 remains unsupported because it overlaps the normal RB/gamepad path on the tested V1 device.
 
+### Info
+
+The Info tab contains the current dated V2 version, a short English description, the GitHub repository link, hardware-beta notice, and the required attribution/link for the application icon.
+
 ### TDP
 
-The base/manual target consists of:
+Every numeric field has a Windows up/down control. The displayed and keyboard-selection order is:
 
 ```text
-STAPM / FAST / SLOW
+STAPM / SLOW / FAST
 ```
 
 Allowed range is `5-35 W`, with:
@@ -77,7 +82,7 @@ Allowed range is `5-35 W`, with:
 STAPM <= SLOW <= FAST
 ```
 
-This is the conventional AMD hierarchy documented by the RyzenAdj option guide: STAPM is the sustained limit, SLOW is the average/medium-duration limit, and FAST is the short boost ceiling. Equality remains valid for balanced presets. Because firmware may still clamp or rewrite a value, the backend performs full read-back verification.
+This is the conventional AMD hierarchy documented by the RyzenAdj option guide: STAPM is the sustained limit, SLOW is the average/medium-duration limit, and FAST is the short boost ceiling. Equality remains valid for balanced presets. Raising STAPM automatically raises SLOW and FAST when necessary; raising SLOW automatically raises FAST. Because firmware may still clamp or rewrite a value, the backend performs full read-back verification.
 
 Reference: <https://github.com/FlyGoat/RyzenAdj/wiki/Options#stapm>
 
@@ -89,7 +94,7 @@ Use **Game Profiles...** and **+ Add profile** to configure:
 
 - profile name;
 - exact executable path selected through the Windows file picker;
-- STAPM, FAST and SLOW target values.
+- STAPM, SLOW and FAST target values.
 
 Profiles can be edited, removed and reordered. Matching uses the normalized, case-insensitive **full executable path**. An executable with the same filename in a different directory does not match.
 
@@ -217,7 +222,7 @@ LegionGoNativeWmiProbe.exe
 build\LegionGoCoreTests.exe
 ```
 
-The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release and includes the Per-Monitor DPI-aware manifest.
+The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release, embeds the application icon and includes the Per-Monitor DPI-aware manifest. Icon attribution is documented in `assets/README.md` and displayed in Settings > Info.
 
 ## Non-hardware tests
 

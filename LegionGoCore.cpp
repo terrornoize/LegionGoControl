@@ -157,6 +157,12 @@ bool ValidateTdpTriple(int stapm, int fast, int slow, std::wstring* error) {
     return ValidateTdpTriple(TdpTriple{stapm, fast, slow}, error);
 }
 
+TdpTriple NormalizeTdpHierarchy(TdpTriple value) noexcept {
+    value.slow = (std::max)(value.slow, value.stapm);
+    value.fast = (std::max)(value.fast, (std::max)(value.slow, value.stapm));
+    return value;
+}
+
 std::wstring NormalizeWindowsPath(const std::wstring& originalPath) {
     if (originalPath.empty()) {
         return {};

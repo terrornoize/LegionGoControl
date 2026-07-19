@@ -49,6 +49,9 @@ void TestTdpValidation() {
     CHECK(error.find(L"SLOW") != std::wstring::npos);
     CHECK(!ValidateTdpTriple(10, 15, 20, &error));
     CHECK(error.find(L"SLOW") != std::wstring::npos && error.find(L"FAST") != std::wstring::npos);
+    CHECK((NormalizeTdpHierarchy({20, 10, 5}) == TdpTriple{20, 20, 20}));
+    CHECK((NormalizeTdpHierarchy({10, 15, 20}) == TdpTriple{10, 20, 20}));
+    CHECK((NormalizeTdpHierarchy({10, 30, 20}) == TdpTriple{10, 30, 20}));
     CHECK((TdpTriple{5, 6, 7} == TdpTriple{5, 6, 7}));
     CHECK((TdpTriple{5, 6, 7} != TdpTriple{5, 7, 7}));
 }

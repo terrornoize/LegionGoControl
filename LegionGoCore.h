@@ -29,6 +29,9 @@ bool operator!=(const TdpTriple& left, const TdpTriple& right) noexcept;
 // hierarchy STAPM <= SLOW <= FAST. On success, error (when supplied) is cleared.
 bool ValidateTdpTriple(const TdpTriple& value, std::wstring* error = nullptr);
 bool ValidateTdpTriple(int stapm, int fast, int slow, std::wstring* error = nullptr);
+// Raises dependent limits only: SLOW becomes at least STAPM and FAST becomes
+// at least both. It does not clamp the overall 5-35 W range.
+TdpTriple NormalizeTdpHierarchy(TdpTriple value) noexcept;
 
 struct GameProfile {
     std::wstring name;
