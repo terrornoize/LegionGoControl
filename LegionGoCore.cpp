@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <set>
 #include <unordered_map>
 #include <utility>
 
@@ -141,6 +142,10 @@ bool ValidateTdpTriple(const TdpTriple& value, std::wstring* error) {
     }
     if (value.stapm > value.slow) {
         SetError(error, L"STAPM must not exceed SLOW.");
+        return false;
+    }
+    if (value.slow > value.fast) {
+        SetError(error, L"SLOW must not exceed FAST (required order: STAPM <= SLOW <= FAST).");
         return false;
     }
 
@@ -386,6 +391,80 @@ std::optional<std::size_t> ArbitrateProfileOptional(
         return std::nullopt;
     }
     return selected;
+}
+
+bool ProcessIdentity::operator<(const ProcessIdentity& other) const noexcept {
+    return pid < other.pid || (pid == other.pid && creation < other.creation);
+}
+
+std::vector<std::size_t> ProcessFamilyTracker::Update(
+    const std::vector<ProcessSample>& processes,
+    const std::vector<GameProfile>& profiles,
+    std::uint64_t nowMilliseconds) {
+    std::set<std::wstring> validProfileKeys;
+    for (const auto& profile : profiles) validProfileKeys.insert(NormalizeWindowsPath(profile.path));
+    for (auto it = members_.begin(); it != members_.end();) {
+        if (!validProfileKeys.count(it->second.profilePathKey) ||
+            nowMilliseconds - it->second.lastSeen > 30000) it = members_.erase(it);
+        else ++it;
+    }
+
+    std::map<std::uint32_t, const ProcessSample*> currentByPid;
+    for (const auto& process : processes) currentByPid[process.identity.pid] = &process;
+    for (const auto& process : processes) {
+        auto member = members_.find(process.identity);
+        if (member != members_.end()) member->second.lastSeen = nowMilliseconds;
+    }
+
+    for (const auto& process : processes) {
+        if (process.path.empty()) continue;
+        for (const auto& profile : profiles) {
+            if (ProfileMatchesProcess(profile, process.path)) {
+                members_[process.identity] = {NormalizeWindowsPath(profile.path), nowMilliseconds};
+                break;
+            }
+        }
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& process : processes) {
+            if (members_.find(process.identity) != members_.end() || process.parentPid == 0) continue;
+            std::wstring inherited;
+            const auto currentParent = currentByPid.find(process.parentPid);
+            if (currentParent != currentByPid.end()) {
+                const auto parentMember = members_.find(currentParent->second->identity);
+                if (parentMember != members_.end()) inherited = parentMember->second.profilePathKey;
+            } else {
+                std::uint64_t newestCreation = 0;
+                for (const auto& member : members_) {
+                    if (member.first.pid == process.parentPid &&
+                        member.first.creation <= process.identity.creation &&
+                        nowMilliseconds - member.second.lastSeen <= 5000 &&
+                        member.first.creation >= newestCreation) {
+                        inherited = member.second.profilePathKey;
+                        newestCreation = member.first.creation;
+                    }
+                }
+            }
+            if (!inherited.empty()) {
+                members_[process.identity] = {inherited, nowMilliseconds};
+                changed = true;
+            }
+        }
+    }
+
+    std::set<std::wstring> activeKeys;
+    for (const auto& process : processes) {
+        const auto member = members_.find(process.identity);
+        if (member != members_.end()) activeKeys.insert(member->second.profilePathKey);
+    }
+    std::vector<std::size_t> activeProfiles;
+    for (std::size_t index = 0; index < profiles.size(); ++index) {
+        if (activeKeys.count(NormalizeWindowsPath(profiles[index].path))) activeProfiles.push_back(index);
+    }
+    return activeProfiles;
 }
 
 TdpTarget MakeBaseTarget(const TdpTriple& base) {

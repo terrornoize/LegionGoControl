@@ -1,4 +1,0 @@
-#include "resource.h"
-
-IDB_LEGIONGO_FRONT BITMAP "assets\\legiongo-front.bmp"
-IDB_LEGIONGO_REAR  BITMAP "assets\\legiongo-rear.bmp"

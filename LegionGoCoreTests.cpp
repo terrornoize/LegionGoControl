@@ -47,6 +47,8 @@ void TestTdpValidation() {
     CHECK(error.find(L"FAST") != std::wstring::npos);
     CHECK(!ValidateTdpTriple(21, 25, 20, &error));
     CHECK(error.find(L"SLOW") != std::wstring::npos);
+    CHECK(!ValidateTdpTriple(10, 15, 20, &error));
+    CHECK(error.find(L"SLOW") != std::wstring::npos && error.find(L"FAST") != std::wstring::npos);
     CHECK((TdpTriple{5, 6, 7} == TdpTriple{5, 6, 7}));
     CHECK((TdpTriple{5, 6, 7} != TdpTriple{5, 7, 7}));
 }
@@ -173,6 +175,46 @@ void TestArbiter() {
     CHECK(!ArbitrateProfileOptional(profiles, {}, 0).has_value());
 }
 
+void TestProcessFamilyTracking() {
+    const std::vector<GameProfile> profiles = {
+        Profile(L"RetroBat", L"C:\\RetroBat\\retrobat.exe", {10, 12, 11}),
+        Profile(L"Other", L"D:\\Games\\other.exe", {15, 20, 18})
+    };
+    ProcessFamilyTracker tracker;
+    auto active = tracker.Update({
+        {{100, 1000}, 1, L"C:\\RetroBat\\RetroBat.exe"},
+        {{200, 1100}, 100, L"C:\\RetroBat\\emulationstation.exe"},
+        {{300, 1200}, 200, L"C:\\RetroBat\\emulators\\retroarch.exe"}
+    }, profiles, 1000);
+    CHECK(active.size() == 1 && active[0] == 0);
+
+    // The launcher and intermediate process may exit; the descendant remains
+    // attached to the already-observed family.
+    active = tracker.Update({{{300, 1200}, 200, L"C:\\RetroBat\\emulators\\retroarch.exe"}}, profiles, 1750);
+    CHECK(active.size() == 1 && active[0] == 0);
+    active = tracker.Update({}, profiles, 2500);
+    CHECK(active.empty());
+
+    // A child discovered immediately after its observed parent exited inherits.
+    ProcessFamilyTracker exitedParentTracker;
+    CHECK(exitedParentTracker.Update({{{400, 4000}, 1, L"C:\\RetroBat\\retrobat.exe"}}, profiles, 4000).size() == 1);
+    active = exitedParentTracker.Update({{{500, 4100}, 400, L"C:\\RetroBat\\emulationstation.exe"}}, profiles, 4500);
+    CHECK(active.size() == 1 && active[0] == 0);
+
+    // PID reuse must not attach children of a different current process.
+    active = exitedParentTracker.Update({
+        {{400, 9000}, 1, L"C:\\Windows\\unrelated.exe"},
+        {{600, 9100}, 400, L"C:\\Windows\\child.exe"}
+    }, profiles, 9000);
+    CHECK(active.empty());
+
+    // If the root was never observed, a matching basename or descendant path
+    // alone cannot activate the family.
+    ProcessFamilyTracker coldTracker;
+    active = coldTracker.Update({{{700, 7000}, 999, L"C:\\RetroBat\\emulationstation.exe"}}, profiles, 7000);
+    CHECK(active.empty());
+}
+
 void TestTargetSemantics() {
     const TdpTriple base{12, 16, 14};
     const std::vector<GameProfile> profiles = {
@@ -215,6 +257,7 @@ int main() {
     TestPathNormalization();
     TestProfileValidation();
     TestArbiter();
+    TestProcessFamilyTracking();
     TestTargetSemantics();
 
     if (failures != 0) {

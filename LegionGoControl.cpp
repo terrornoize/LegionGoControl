@@ -16,7 +16,6 @@
 #include <objbase.h>
 
 #include "LegionGoCore.h"
-#include "resource.h"
 
 #include <algorithm>
 #include <atomic>
@@ -47,7 +46,6 @@ constexpr wchar_t HIDDEN_CLASS[] = L"LegionGoControlHiddenWindow";
 constexpr wchar_t SETTINGS_CLASS[] = L"LegionGoControlSettingsWindow";
 constexpr wchar_t PROFILES_CLASS[] = L"LegionGoControlProfilesWindow";
 constexpr wchar_t PROFILE_EDITOR_CLASS[] = L"LegionGoControlProfileEditor";
-constexpr wchar_t DIAGRAM_CLASS[] = L"LegionGoControlDiagram";
 constexpr wchar_t SINGLETON_MUTEX[] = L"Global\\LegionGoControlSingletonMutex";
 constexpr wchar_t BACKEND_MUTEX[] = L"Global\\LegionGoControlBackendMutex";
 
@@ -68,6 +66,8 @@ constexpr int IDC_LOGGING = 5010;
 constexpr int IDC_STARTUP = 5011;
 constexpr int IDC_DEBOUNCE = 5012;
 constexpr int IDC_COOLDOWN = 5013;
+constexpr int IDC_DEBOUNCE_SPIN = 5018;
+constexpr int IDC_COOLDOWN_SPIN = 5019;
 constexpr int IDC_OPEN_LOG = 5015;
 constexpr int IDC_BATTERY = 5016;
 constexpr int IDC_BATTERY_STATUS = 5017;
@@ -80,11 +80,13 @@ constexpr int IDC_BUTTON_PATH = 5035;
 constexpr int IDC_BUTTON_ARGS = 5036;
 constexpr int IDC_BUTTON_WORKDIR = 5037;
 constexpr int IDC_BUTTON_INTERNAL = 5038;
-constexpr int IDC_DIAGRAM = 5039;
 constexpr int IDC_BUTTON_BROWSE = 5040;
 constexpr int IDC_BASE_STAPM = 5050;
 constexpr int IDC_BASE_FAST = 5051;
 constexpr int IDC_BASE_SLOW = 5052;
+constexpr int IDC_BASE_STAPM_SPIN = 5053;
+constexpr int IDC_BASE_FAST_SPIN = 5054;
+constexpr int IDC_BASE_SLOW_SPIN = 5055;
 constexpr int IDC_TDP_PRESET_FIRST = 5060;
 constexpr int IDC_MANAGE_PROFILES = 5070;
 constexpr int IDC_TDP_STATUS = 5071;
@@ -103,6 +105,9 @@ constexpr int IDC_PE_FAST = 5154;
 constexpr int IDC_PE_SLOW = 5155;
 constexpr int IDC_PE_OK = 5156;
 constexpr int IDC_PE_CANCEL = 5157;
+constexpr int IDC_PE_STAPM_SPIN = 5158;
+constexpr int IDC_PE_FAST_SPIN = 5159;
+constexpr int IDC_PE_SLOW_SPIN = 5160;
 
 HINSTANCE g_instance = nullptr;
 HWND g_hidden = nullptr;
@@ -111,8 +116,6 @@ HWND g_profilesWindow = nullptr;
 NOTIFYICONDATAW g_nid{};
 HICON g_icon = nullptr;
 HFONT g_font = nullptr;
-HBITMAP g_frontBitmap = nullptr;
-HBITMAP g_rearBitmap = nullptr;
 HANDLE g_singleton = nullptr;
 UINT g_taskbarCreated = 0;
 
@@ -655,26 +658,28 @@ bool g_workerStop = false;
 RuntimeStatus g_runtime;
 std::thread g_worker;
 
-bool EnumerateProcessPaths(std::vector<std::wstring>& result) {
-    std::vector<std::wstring> current;
+ULONGLONG FileTimeValue(const FILETIME& value) {
+    ULARGE_INTEGER result{}; result.LowPart = value.dwLowDateTime; result.HighPart = value.dwHighDateTime; return result.QuadPart;
+}
+bool EnumerateProcesses(std::vector<LegionGoCore::ProcessSample>& result) {
+    std::vector<LegionGoCore::ProcessSample> current;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return false;
     PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
-    if (!Process32FirstW(snapshot, &entry)) {
-        CloseHandle(snapshot);
-        return false;
-    }
+    if (!Process32FirstW(snapshot, &entry)) { CloseHandle(snapshot); return false; }
     do {
         HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
-        if (process) {
-            std::vector<wchar_t> path(32768); DWORD count = static_cast<DWORD>(path.size());
-            if (QueryFullProcessImageNameW(process, 0, path.data(), &count)) current.emplace_back(path.data(), count);
-            CloseHandle(process);
-        }
+        if (!process) continue;
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) { CloseHandle(process); continue; }
+        LegionGoCore::ProcessSample record;
+        record.identity = {static_cast<std::uint32_t>(entry.th32ProcessID), FileTimeValue(creation)};
+        record.parentPid = static_cast<std::uint32_t>(entry.th32ParentProcessID);
+        std::vector<wchar_t> path(32768); DWORD count = static_cast<DWORD>(path.size());
+        if (QueryFullProcessImageNameW(process, 0, path.data(), &count)) record.path.assign(path.data(), count);
+        CloseHandle(process); current.push_back(std::move(record));
     } while (Process32NextW(snapshot, &entry));
-    CloseHandle(snapshot);
-    result.swap(current);
-    return true;
+    CloseHandle(snapshot); result.swap(current); return true;
 }
 void PublishRuntime(const RuntimeStatus& value) {
     { std::lock_guard<std::mutex> lock(g_workerMutex); g_runtime = value; }
@@ -685,14 +690,16 @@ void WorkerMain() {
     bool haveAttemptedTarget = false;
     std::wstring attemptedIdentity;
     ULONGLONG lastAttemptTick = 0;
-    std::vector<std::wstring> processPaths;
+    std::vector<LegionGoCore::ProcessSample> processes;
+    std::vector<std::wstring> activeProfilePaths;
+    LegionGoCore::ProcessFamilyTracker familyTracker;
     unsigned consecutiveSnapshotFailures = 0;
     RuntimeStatus status;
     for (;;) {
         std::deque<WorkerJob> jobs;
         {
             std::unique_lock<std::mutex> lock(g_workerMutex);
-            g_workerCondition.wait_for(lock, std::chrono::seconds(2), [] { return g_workerStop || !g_workerJobs.empty(); });
+            g_workerCondition.wait_for(lock, std::chrono::milliseconds(750), [] { return g_workerStop || !g_workerJobs.empty(); });
             if (g_workerStop) break;
             jobs.swap(g_workerJobs);
         }
@@ -730,19 +737,22 @@ void WorkerMain() {
             profiles.clear();
             activeId.clear();
         }
-        if (EnumerateProcessPaths(processPaths)) {
+        if (EnumerateProcesses(processes)) {
             consecutiveSnapshotFailures = 0;
+            activeProfilePaths.clear();
+            for (const std::size_t index : familyTracker.Update(processes, profiles, GetTickCount64())) {
+                if (index < profiles.size()) activeProfilePaths.push_back(profiles[index].path);
+            }
         } else {
             ++consecutiveSnapshotFailures;
-            Log(L"Toolhelp snapshot failed; retaining the previous process sample.");
-            // One transient snapshot failure must not cause a disruptive TDP
-            // change.  Persistent failure must not leave a game override
-            // latched forever after that game exits.
-            if (consecutiveSnapshotFailures >= 3) processPaths.clear();
+            Log(L"Toolhelp snapshot failed; retaining the previous process-family sample.");
+            // A transient failure must not cause a disruptive restore. After
+            // repeated failures, fail safe to the base target.
+            if (consecutiveSnapshotFailures >= 3) activeProfilePaths.clear();
         }
         std::size_t current = LegionGoCore::kNoProfile;
         for (std::size_t index = 0; index < stored.size(); ++index) if (stored[index].id == activeId) current = index;
-        const std::size_t selected = LegionGoCore::ArbitrateProfile(profiles, processPaths, current);
+        const std::size_t selected = LegionGoCore::ArbitrateProfile(profiles, activeProfilePaths, current);
         status.profileActive = selected < stored.size();
         status.profileId = status.profileActive ? stored[selected].id : L"";
         status.profileName = status.profileActive ? stored[selected].value.name : L"";
@@ -813,6 +823,15 @@ HWND Control(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, 
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
     SetControlFont(result); return result;
 }
+void ConfigureSpinner(HWND spinner, HWND buddy, int minimum, int maximum) {
+    SendMessageW(spinner, UDM_SETBUDDY, reinterpret_cast<WPARAM>(buddy), 0);
+    SendMessageW(spinner, UDM_SETRANGE32, static_cast<WPARAM>(minimum), static_cast<LPARAM>(maximum));
+}
+void SetNumericValue(HWND parent, int editId, int spinnerId, int value) {
+    SetWindowTextW(GetDlgItem(parent, editId), std::to_wstring(value).c_str());
+    HWND spinner = GetDlgItem(parent, spinnerId);
+    if (spinner) SendMessageW(spinner, UDM_SETPOS32, 0, static_cast<LPARAM>(value));
+}
 std::wstring WindowText(HWND control) {
     const int length = GetWindowTextLengthW(control);
     std::vector<wchar_t> text(static_cast<std::size_t>(length) + 1);
@@ -879,7 +898,6 @@ void LoadControllerEditor(HWND hwnd) {
     SetText(hwnd, IDC_BUTTON_INTERNAL, button.internal);
     state->loading = false;
     UpdateControllerActionFields(hwnd);
-    InvalidateRect(GetDlgItem(hwnd, IDC_DIAGRAM), nullptr, TRUE);
 }
 void StoreControllerEditor(HWND hwnd) {
     SettingsState* state = SettingsData(hwnd); if (!state || state->loading || state->buttons.empty()) return;
@@ -901,11 +919,14 @@ void PopulateSettings(HWND hwnd) {
     state->startup = IsStartupEnabled();
     SendDlgItemMessageW(hwnd, IDC_LOGGING, BM_SETCHECK, g_logging.load() ? BST_CHECKED : BST_UNCHECKED, 0);
     SendDlgItemMessageW(hwnd, IDC_STARTUP, BM_SETCHECK, state->startup ? BST_CHECKED : BST_UNCHECKED, 0);
-    SetText(hwnd, IDC_DEBOUNCE, std::to_wstring(state->debounce)); SetText(hwnd, IDC_COOLDOWN, std::to_wstring(state->cooldown));
+    SetNumericValue(hwnd, IDC_DEBOUNCE, IDC_DEBOUNCE_SPIN, state->debounce);
+    SetNumericValue(hwnd, IDC_COOLDOWN, IDC_COOLDOWN_SPIN, state->cooldown);
     HWND choices = GetDlgItem(hwnd, IDC_BUTTON_SELECT); SendMessageW(choices, CB_RESETCONTENT, 0, 0);
     for (const auto& button : state->buttons) SendMessageW(choices, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(button.name.c_str()));
     SendMessageW(choices, CB_SETCURSEL, 0, 0);
-    SetText(hwnd, IDC_BASE_STAPM, std::to_wstring(state->base.stapm)); SetText(hwnd, IDC_BASE_FAST, std::to_wstring(state->base.fast)); SetText(hwnd, IDC_BASE_SLOW, std::to_wstring(state->base.slow));
+    SetNumericValue(hwnd, IDC_BASE_STAPM, IDC_BASE_STAPM_SPIN, state->base.stapm);
+    SetNumericValue(hwnd, IDC_BASE_FAST, IDC_BASE_FAST_SPIN, state->base.fast);
+    SetNumericValue(hwnd, IDC_BASE_SLOW, IDC_BASE_SLOW_SPIN, state->base.slow);
     state->loading = false; LoadControllerEditor(hwnd);
 }
 bool ApplySettings(HWND hwnd) {
@@ -945,58 +966,6 @@ bool ApplySettings(HWND hwnd) {
     LoadConfiguration(); QueueWorker(WorkerJob::Wake); Balloon(L"Settings applied."); return true;
 }
 
-bool DrawBitmapFit(HDC destination, HBITMAP bitmap, const RECT& bounds) {
-    if (!bitmap) return false;
-    BITMAP information{};
-    if (!GetObjectW(bitmap, sizeof(information), &information) || information.bmWidth <= 0 || information.bmHeight <= 0) return false;
-    const int availableWidth = bounds.right - bounds.left, availableHeight = bounds.bottom - bounds.top;
-    int width = availableWidth;
-    int height = MulDiv(width, information.bmHeight, information.bmWidth);
-    if (height > availableHeight) { height = availableHeight; width = MulDiv(height, information.bmWidth, information.bmHeight); }
-    const int x = bounds.left + (availableWidth - width) / 2;
-    const int y = bounds.top + (availableHeight - height) / 2;
-    HDC source = CreateCompatibleDC(destination);
-    if (!source) return false;
-    HGDIOBJ previous = SelectObject(source, bitmap);
-    SetStretchBltMode(destination, HALFTONE); SetBrushOrgEx(destination, 0, 0, nullptr);
-    const BOOL drawn = StretchBlt(destination, x, y, width, height, source, 0, 0,
-                                  information.bmWidth, information.bmHeight, SRCCOPY);
-    SelectObject(source, previous); DeleteDC(source); return drawn == TRUE;
-}
-
-LRESULT CALLBACK DiagramProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_ERASEBKGND) return 1;
-    if (message == WM_PAINT) {
-        PAINTSTRUCT paint{}; HDC dc = BeginPaint(hwnd, &paint); RECT client{}; GetClientRect(hwnd, &client);
-        HBRUSH background = CreateSolidBrush(RGB(10, 11, 17)); FillRect(dc, &client, background); DeleteObject(background);
-        SetMapMode(dc, MM_ANISOTROPIC); SetWindowExtEx(dc, 350, 292, nullptr);
-        SetViewportExtEx(dc, (std::max)(1L, client.right - client.left), (std::max)(1L, client.bottom - client.top), nullptr);
-        SetBkMode(dc, TRANSPARENT); SelectObject(dc, g_font);
-        HWND settings = GetParent(hwnd); SettingsState* state = SettingsData(settings);
-        const std::wstring selected = state && !state->buttons.empty() ? state->buttons[static_cast<std::size_t>(state->selectedButton)].name : L"";
-        const bool front = selected == L"Menu" || selected == L"View";
-        std::wstring callout;
-        if (selected == L"Menu") callout = L"29"; else if (selected == L"View") callout = L"31";
-        else if (selected == L"Y1") callout = L"24"; else if (selected == L"Y2") callout = L"25";
-        else if (selected == L"Y3") callout = L"18"; else if (selected == L"M2") callout = L"16";
-        else if (selected == L"M3") callout = L"17";
-        SetTextColor(dc, RGB(235, 238, 245));
-        const std::wstring heading = (front ? L"FRONT CONTROLS - " : L"REAR CONTROLS - ") + selected +
-                                     (callout.empty() ? L"" : L" (callout " + callout + L")");
-        RECT headingRect{8, 7, 342, 30}; DrawTextW(dc, heading.c_str(), -1, &headingRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-        const RECT imageRect{7, 34, 343, 252};
-        if (!DrawBitmapFit(dc, front ? g_frontBitmap : g_rearBitmap, imageRect)) {
-            SetTextColor(dc, RGB(245, 180, 70));
-            RECT errorRect{15, 100, 335, 145}; DrawTextW(dc, L"Controller reference image unavailable", -1, &errorRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-        SetTextColor(dc, RGB(190, 195, 205));
-        const wchar_t* footer = front ? L"Front reference: 29 Menu, 31 View" : L"Rear reference: 16 M2, 17 M3, 18 Y3, 24 Y1, 25 Y2";
-        RECT footerRect{7, 258, 343, 286}; DrawTextW(dc, footer, -1, &footerRect, DT_CENTER | DT_WORDBREAK);
-        EndPaint(hwnd, &paint); return 0;
-    }
-    return DefWindowProcW(hwnd, message, wParam, lParam);
-}
-
 void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     HWND tab = Control(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP, 12, 12, 876, 548, IDC_TAB);
     TCITEMW item{}; item.mask = TCIF_TEXT;
@@ -1011,9 +980,13 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     PageField(state, 0, hwnd, L"BUTTON", L"Battery charge limit 80%", BS_AUTOCHECKBOX | WS_TABSTOP, x, y + 72, 320, 28, IDC_BATTERY);
     PageField(state, 0, hwnd, L"STATIC", L"Reading firmware state...", SS_LEFT, x + 340, y + 75, 430, 24, IDC_BATTERY_STATUS);
     Label(state, 0, hwnd, L"HID debounce (0-1000 ms):", x, y + 125, 210, 22);
-    PageField(state, 0, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 220, y + 122, 90, 24, IDC_DEBOUNCE, WS_EX_CLIENTEDGE);
+    HWND debounceEdit = PageField(state, 0, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 220, y + 122, 70, 26, IDC_DEBOUNCE, WS_EX_CLIENTEDGE);
+    HWND debounceSpin = PageField(state, 0, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 292, y + 122, 22, 26, IDC_DEBOUNCE_SPIN);
+    ConfigureSpinner(debounceSpin, debounceEdit, 0, 1000);
     Label(state, 0, hwnd, L"Action cooldown (50-5000 ms):", x, y + 163, 230, 22);
-    PageField(state, 0, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 220, y + 160, 90, 24, IDC_COOLDOWN, WS_EX_CLIENTEDGE);
+    HWND cooldownEdit = PageField(state, 0, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 220, y + 160, 70, 26, IDC_COOLDOWN, WS_EX_CLIENTEDGE);
+    HWND cooldownSpin = PageField(state, 0, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 292, y + 160, 22, 26, IDC_COOLDOWN_SPIN);
+    ConfigureSpinner(cooldownSpin, cooldownEdit, 50, 5000);
     PageField(state, 0, hwnd, L"BUTTON", L"Open log", BS_PUSHBUTTON, x, y + 215, 110, 28, IDC_OPEN_LOG);
     Label(state, 0, hwnd, L"Battery changes are verified by the Lenovo WMI backend. Apply writes only known INI keys.", x, y + 270, 620, 40);
 
@@ -1027,20 +1000,24 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 1, hwnd, L"Action:", x, y + 80, 65, 22);
     HWND action = PageField(state, 1, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, x + 65, y + 76, 150, 160, IDC_BUTTON_ACTION);
     for (const wchar_t* value : {L"None", L"Keys", L"Launch", L"Internal"}) SendMessageW(action, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
-    Label(state, 1, hwnd, L"Keys:", x, y + 120, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 116, 245, 24, IDC_BUTTON_KEYS, WS_EX_CLIENTEDGE);
-    Label(state, 1, hwnd, L"Path:", x, y + 154, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 150, 190, 24, IDC_BUTTON_PATH, WS_EX_CLIENTEDGE);
-    PageField(state, 1, hwnd, L"BUTTON", L"...", BS_PUSHBUTTON, x + 260, y + 149, 50, 26, IDC_BUTTON_BROWSE);
-    Label(state, 1, hwnd, L"Arguments:", x, y + 188, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 184, 245, 24, IDC_BUTTON_ARGS, WS_EX_CLIENTEDGE);
-    Label(state, 1, hwnd, L"Work dir:", x, y + 222, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 218, 245, 24, IDC_BUTTON_WORKDIR, WS_EX_CLIENTEDGE);
-    Label(state, 1, hwnd, L"Internal:", x, y + 256, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 252, 245, 24, IDC_BUTTON_INTERNAL, WS_EX_CLIENTEDGE);
-    PageField(state, 1, hwnd, DIAGRAM_CLASS, L"", WS_BORDER, 470, y, 390, 326, IDC_DIAGRAM, WS_EX_CLIENTEDGE);
-    Label(state, 1, hwnd, L"M1 remains intentionally unmapped because it overlaps the normal RB/gamepad path.", x, y + 350, 800, 35);
+    Label(state, 1, hwnd, L"Keys:", x, y + 120, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 116, 650, 26, IDC_BUTTON_KEYS, WS_EX_CLIENTEDGE);
+    Label(state, 1, hwnd, L"Path:", x, y + 158, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 154, 585, 26, IDC_BUTTON_PATH, WS_EX_CLIENTEDGE);
+    PageField(state, 1, hwnd, L"BUTTON", L"Browse...", BS_PUSHBUTTON, x + 660, y + 153, 90, 28, IDC_BUTTON_BROWSE);
+    Label(state, 1, hwnd, L"Arguments:", x, y + 196, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 192, 650, 26, IDC_BUTTON_ARGS, WS_EX_CLIENTEDGE);
+    Label(state, 1, hwnd, L"Work dir:", x, y + 234, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 230, 650, 26, IDC_BUTTON_WORKDIR, WS_EX_CLIENTEDGE);
+    Label(state, 1, hwnd, L"Internal:", x, y + 272, 65, 22); PageField(state, 1, hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, x + 65, y + 268, 650, 26, IDC_BUTTON_INTERNAL, WS_EX_CLIENTEDGE);
+    Label(state, 1, hwnd, L"Key examples: WIN+TAB, ALT+TAB, CTRL+SHIFT+ESC, F13. Launch actions support arguments and a working directory.", x, y + 325, 800, 42);
+    Label(state, 1, hwnd, L"M1 remains intentionally unmapped because it overlaps the normal RB/gamepad path.", x, y + 380, 800, 35);
 
     Label(state, 2, hwnd, L"Base TDP is restored whenever no configured game is running and on a clean exit.", x, y, 650, 24);
     Label(state, 2, hwnd, L"STAPM (W)", x, y + 50, 100, 22); Label(state, 2, hwnd, L"FAST (W)", x + 145, y + 50, 100, 22); Label(state, 2, hwnd, L"SLOW (W)", x + 290, y + 50, 100, 22);
-    PageField(state, 2, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER, x, y + 75, 100, 25, IDC_BASE_STAPM, WS_EX_CLIENTEDGE);
-    PageField(state, 2, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER, x + 145, y + 75, 100, 25, IDC_BASE_FAST, WS_EX_CLIENTEDGE);
-    PageField(state, 2, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER, x + 290, y + 75, 100, 25, IDC_BASE_SLOW, WS_EX_CLIENTEDGE);
+    HWND baseStapm = PageField(state, 2, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER, x, y + 75, 76, 27, IDC_BASE_STAPM, WS_EX_CLIENTEDGE);
+    HWND baseStapmSpin = PageField(state, 2, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 78, y + 75, 22, 27, IDC_BASE_STAPM_SPIN); ConfigureSpinner(baseStapmSpin, baseStapm, 5, 35);
+    HWND baseFast = PageField(state, 2, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER, x + 145, y + 75, 76, 27, IDC_BASE_FAST, WS_EX_CLIENTEDGE);
+    HWND baseFastSpin = PageField(state, 2, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 223, y + 75, 22, 27, IDC_BASE_FAST_SPIN); ConfigureSpinner(baseFastSpin, baseFast, 5, 35);
+    HWND baseSlow = PageField(state, 2, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER, x + 290, y + 75, 76, 27, IDC_BASE_SLOW, WS_EX_CLIENTEDGE);
+    HWND baseSlowSpin = PageField(state, 2, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 368, y + 75, 22, 27, IDC_BASE_SLOW_SPIN); ConfigureSpinner(baseSlowSpin, baseSlow, 5, 35);
+    Label(state, 2, hwnd, L"Required order: STAPM <= SLOW <= FAST", x + 430, y + 78, 330, 24);
     Label(state, 2, hwnd, L"Balanced presets:", x, y + 125, 120, 22);
     const int presets[] = {5, 8, 10, 12, 16, 20, 25, 30};
     for (int index = 0; index < 8; ++index) PageField(state, 2, hwnd, L"BUTTON", (std::to_wstring(presets[index]) + L" W").c_str(), BS_PUSHBUTTON,
@@ -1089,7 +1066,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                 if (GetOpenFileNameW(&dialog)) SetText(hwnd, IDC_BUTTON_PATH, path);
             } else if (id >= IDC_TDP_PRESET_FIRST && id < IDC_TDP_PRESET_FIRST + 8) {
                 const int presets[] = {5,8,10,12,16,20,25,30}; const int value = presets[id - IDC_TDP_PRESET_FIRST];
-                SetText(hwnd, IDC_BASE_STAPM, std::to_wstring(value)); SetText(hwnd, IDC_BASE_FAST, std::to_wstring(value)); SetText(hwnd, IDC_BASE_SLOW, std::to_wstring(value));
+                SetNumericValue(hwnd, IDC_BASE_STAPM, IDC_BASE_STAPM_SPIN, value);
+                SetNumericValue(hwnd, IDC_BASE_FAST, IDC_BASE_FAST_SPIN, value);
+                SetNumericValue(hwnd, IDC_BASE_SLOW, IDC_BASE_SLOW_SPIN, value);
             } else if (id == IDC_MANAGE_PROFILES) ShowProfilesWindow();
             return 0;
         }
@@ -1146,9 +1125,16 @@ LRESULT CALLBACK ProfileEditorProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             Control(hwnd, L"EDIT", context->value.path.c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 128, 55, 330, 24, IDC_PE_PATH, WS_EX_CLIENTEDGE);
             Control(hwnd, L"BUTTON", L"Browse...", BS_PUSHBUTTON, 468, 54, 82, 26, IDC_PE_BROWSE);
             Control(hwnd, L"STATIC", L"STAPM (W)", SS_LEFT, 18, 110, 95, 20, 0); Control(hwnd, L"STATIC", L"FAST (W)", SS_LEFT, 155, 110, 95, 20, 0); Control(hwnd, L"STATIC", L"SLOW (W)", SS_LEFT, 292, 110, 95, 20, 0);
-            Control(hwnd, L"EDIT", std::to_wstring(context->value.tdp.stapm).c_str(), WS_BORDER | ES_NUMBER, 18, 134, 95, 24, IDC_PE_STAPM, WS_EX_CLIENTEDGE);
-            Control(hwnd, L"EDIT", std::to_wstring(context->value.tdp.fast).c_str(), WS_BORDER | ES_NUMBER, 155, 134, 95, 24, IDC_PE_FAST, WS_EX_CLIENTEDGE);
-            Control(hwnd, L"EDIT", std::to_wstring(context->value.tdp.slow).c_str(), WS_BORDER | ES_NUMBER, 292, 134, 95, 24, IDC_PE_SLOW, WS_EX_CLIENTEDGE);
+            HWND stapmEdit = Control(hwnd, L"EDIT", L"", WS_BORDER | ES_NUMBER, 18, 134, 72, 26, IDC_PE_STAPM, WS_EX_CLIENTEDGE);
+            HWND stapmSpin = Control(hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, 92, 134, 22, 26, IDC_PE_STAPM_SPIN); ConfigureSpinner(stapmSpin, stapmEdit, 5, 35);
+            HWND fastEdit = Control(hwnd, L"EDIT", L"", WS_BORDER | ES_NUMBER, 155, 134, 72, 26, IDC_PE_FAST, WS_EX_CLIENTEDGE);
+            HWND fastSpin = Control(hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, 229, 134, 22, 26, IDC_PE_FAST_SPIN); ConfigureSpinner(fastSpin, fastEdit, 5, 35);
+            HWND slowEdit = Control(hwnd, L"EDIT", L"", WS_BORDER | ES_NUMBER, 292, 134, 72, 26, IDC_PE_SLOW, WS_EX_CLIENTEDGE);
+            HWND slowSpin = Control(hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, 366, 134, 22, 26, IDC_PE_SLOW_SPIN); ConfigureSpinner(slowSpin, slowEdit, 5, 35);
+            SetNumericValue(hwnd, IDC_PE_STAPM, IDC_PE_STAPM_SPIN, context->value.tdp.stapm);
+            SetNumericValue(hwnd, IDC_PE_FAST, IDC_PE_FAST_SPIN, context->value.tdp.fast);
+            SetNumericValue(hwnd, IDC_PE_SLOW, IDC_PE_SLOW_SPIN, context->value.tdp.slow);
+            Control(hwnd, L"STATIC", L"Required order: STAPM <= SLOW <= FAST", SS_LEFT, 410, 137, 155, 38, 0);
             Control(hwnd, L"STATIC", L"The executable must be an absolute .exe path. Matching uses the full normalized path.", SS_LEFT, 18, 180, 530, 35, 0);
             Control(hwnd, L"BUTTON", L"OK", BS_DEFPUSHBUTTON, 382, 226, 80, 28, IDC_PE_OK); Control(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON, 470, 226, 80, 28, IDC_PE_CANCEL);
             return 0;
@@ -1384,22 +1370,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         HWND existing = FindWindowW(HIDDEN_CLASS, nullptr); if (existing) PostMessageW(existing, WMAPP_SHOW_SETTINGS, 2, 0);
         CloseHandle(g_singleton); g_singleton = nullptr; return 0;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&controls);
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_UPDOWN_CLASS}; InitCommonControlsEx(&controls);
     const UINT dpi = SystemDpi();
     g_font = CreateFontW(-MulDiv(10, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     RegisterWindowClass(HIDDEN_CLASS, HiddenProc, nullptr); RegisterWindowClass(SETTINGS_CLASS, SettingsProc);
     RegisterWindowClass(PROFILES_CLASS, ProfilesProc); RegisterWindowClass(PROFILE_EDITOR_CLASS, ProfileEditorProc);
-    RegisterWindowClass(DIAGRAM_CLASS, DiagramProc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
     g_icon = CreateTrayIcon();
-    g_frontBitmap = static_cast<HBITMAP>(LoadImageW(instance, MAKEINTRESOURCEW(IDB_LEGIONGO_FRONT), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
-    g_rearBitmap = static_cast<HBITMAP>(LoadImageW(instance, MAKEINTRESOURCEW(IDB_LEGIONGO_REAR), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
-    if (!g_frontBitmap || !g_rearBitmap) LogAlways(L"Controller image resource could not be loaded.");
     g_hidden = CreateWindowExW(0, HIDDEN_CLASS, APP_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 300, 200, nullptr, nullptr, instance, nullptr);
     if (!g_hidden) {
         if (g_icon) DestroyIcon(g_icon); if (g_font) DeleteObject(g_font);
-        if (g_frontBitmap) DeleteObject(g_frontBitmap); if (g_rearBitmap) DeleteObject(g_rearBitmap);
         if (g_singleton) { ReleaseMutex(g_singleton); CloseHandle(g_singleton); } return 2;
     }
     StartWorker();
@@ -1415,7 +1396,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     StopWorker();
     if (getMessageResult < 0) LogAlways(L"GetMessage failed: " + std::to_wstring(GetLastError()));
     if (g_icon) DestroyIcon(g_icon); if (g_font) DeleteObject(g_font);
-    if (g_frontBitmap) DeleteObject(g_frontBitmap); if (g_rearBitmap) DeleteObject(g_rearBitmap);
     if (g_singleton) { ReleaseMutex(g_singleton); CloseHandle(g_singleton); }
     return static_cast<int>(message.wParam);
 }

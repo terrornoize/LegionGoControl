@@ -46,7 +46,7 @@ Startup, battery limit and logging were moved from the tray into **Settings > Ge
 
 ### Controller
 
-The Controller tab includes embedded front/rear Legion Go product-reference diagrams with numbered callouts. It automatically switches view according to the selected button and edits:
+The Controller tab provides a compact editor for:
 
 ```text
 Menu, View, Y1, Y2, Y3, M2, M3
@@ -74,9 +74,12 @@ STAPM / FAST / SLOW
 Allowed range is `5-35 W`, with:
 
 ```text
-STAPM <= FAST
-STAPM <= SLOW
+STAPM <= SLOW <= FAST
 ```
+
+This is the conventional AMD hierarchy documented by the RyzenAdj option guide: STAPM is the sustained limit, SLOW is the average/medium-duration limit, and FAST is the short boost ceiling. Equality remains valid for balanced presets. Because firmware may still clamp or rewrite a value, the backend performs full read-back verification.
+
+Reference: <https://github.com/FlyGoat/RyzenAdj/wiki/Options#stapm>
 
 Balanced preset buttons set all three values to the same wattage. The base target is persisted and is restored whenever no configured Game Profile is running.
 
@@ -92,15 +95,19 @@ Profiles can be edited, removed and reordered. Matching uses the normalized, cas
 
 ### Runtime behavior
 
-The process monitor scans approximately every two seconds using `CreateToolhelp32Snapshot` and `QueryFullProcessImageNameW`.
+The process monitor scans approximately every 750 ms using `CreateToolhelp32Snapshot`, PID/parent PID, process creation time and `QueryFullProcessImageNameW`.
 
 1. A process already open when LegionGoControl starts is detected.
 2. Starting a configured executable applies its profile once.
-3. Multiple instances of the same executable keep the profile active until the final instance exits.
-4. If multiple configured executables run, the current profile remains active while its process exists; otherwise the first matching profile in the configured order wins.
-5. Switching profiles applies the new target directly, without restoring base in between.
-6. Closing the final profiled executable restores the persisted base/manual TDP.
-7. Changing base TDP while a profile is active changes the future restore target; it does not replace the active game target.
+3. Child processes automatically inherit the profile. A chain such as `RetroBat -> EmulationStation -> emulator` remains active even after the launcher exits.
+4. Process identity combines PID and creation time to protect against PID reuse. A recently exited parent is retained briefly so its child can still be attached on the next scan.
+5. Multiple instances and descendants keep the profile active until the final member of the process family exits.
+6. If multiple profile families run, the current profile remains active while its family exists; otherwise the first matching profile in configured order wins.
+7. Switching profiles applies the new target directly, without restoring base in between.
+8. Closing the final profiled process family restores the persisted base/manual TDP.
+9. Changing base TDP while a profile is active changes the future restore target; it does not replace the active game target.
+
+Automatic following requires LegionGoControl to observe the configured root executable at least once. No Windows API can reconstruct a launcher relationship that ended before LegionGoControl itself started.
 
 The active profile and latest backend result are shown in the tray tooltip, tray menu and Game Profiles list.
 
@@ -210,7 +217,7 @@ LegionGoNativeWmiProbe.exe
 build\LegionGoCoreTests.exe
 ```
 
-The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release, embeds the controller bitmap resources and includes the Per-Monitor DPI-aware manifest. Image source references are recorded in `assets/README.md`.
+The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release and includes the Per-Monitor DPI-aware manifest.
 
 ## Non-hardware tests
 
@@ -224,6 +231,7 @@ The pure-core suite tests:
 - Windows path normalization and exact matching;
 - profile validation and duplicate detection;
 - deterministic arbitration with multiple running executables;
+- automatic launcher/child/grandchild process-family tracking and PID reuse;
 - base/profile target and restore semantics.
 
 The tests never invoke WMI, change TDP, toggle battery state or launch the tray application.

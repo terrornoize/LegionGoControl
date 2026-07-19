@@ -748,6 +748,10 @@ static bool ValidateTdp(const TdpValues& values, std::wstring& error) {
         error = L"STAPM non può essere superiore a SLOW";
         return false;
     }
+    if (values.slow > values.fast) {
+        error = L"SLOW non può essere superiore a FAST (ordine richiesto: STAPM <= SLOW <= FAST)";
+        return false;
+    }
     return true;
 }
 
@@ -885,15 +889,16 @@ static bool ApplyTdpOrdered(
             wmi, TDP_ID_STAPM, target.stapm, L"STAPM", expected, error)) {
         return false;
     }
-    // Lower ceilings only after STAPM has reached its target.
-    if (target.fast < before.fast &&
-        !SetAndVerifyTdpTriple(
-            wmi, TDP_ID_FAST, target.fast, L"FAST lower", expected, error)) {
-        return false;
-    }
+    // Lower the middle SLOW limit before FAST so the conventional hierarchy
+    // STAPM <= SLOW <= FAST remains valid throughout the transaction.
     if (target.slow < before.slow &&
         !SetAndVerifyTdpTriple(
             wmi, TDP_ID_SLOW, target.slow, L"SLOW lower", expected, error)) {
+        return false;
+    }
+    if (target.fast < before.fast &&
+        !SetAndVerifyTdpTriple(
+            wmi, TDP_ID_FAST, target.fast, L"FAST lower", expected, error)) {
         return false;
     }
 

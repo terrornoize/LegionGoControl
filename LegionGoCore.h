@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,8 +25,8 @@ struct TdpTriple {
 bool operator==(const TdpTriple& left, const TdpTriple& right) noexcept;
 bool operator!=(const TdpTriple& left, const TdpTriple& right) noexcept;
 
-// A valid triple has every value in [5, 35], and STAPM does not exceed either
-// FAST or SLOW.  On success, error (when supplied) is cleared.
+// A valid triple has every value in [5, 35] and follows the conventional AMD
+// hierarchy STAPM <= SLOW <= FAST. On success, error (when supplied) is cleared.
 bool ValidateTdpTriple(const TdpTriple& value, std::wstring* error = nullptr);
 bool ValidateTdpTriple(int stapm, int fast, int slow, std::wstring* error = nullptr);
 
@@ -83,6 +85,36 @@ std::optional<std::size_t> ArbitrateProfileOptional(
     const std::vector<GameProfile>& profiles,
     const std::vector<std::wstring>& runningProcessPaths,
     std::optional<std::size_t> currentProfile = std::nullopt);
+
+struct ProcessIdentity {
+    std::uint32_t pid = 0;
+    std::uint64_t creation = 0;
+    bool operator<(const ProcessIdentity& other) const noexcept;
+};
+
+struct ProcessSample {
+    ProcessIdentity identity;
+    std::uint32_t parentPid = 0;
+    std::wstring path;
+};
+
+// Automatically keeps a profile active for descendants of an observed root.
+// Dead parents are retained briefly so children discovered in the next poll
+// still inherit; PID+creation prevents PID reuse from joining an old family.
+class ProcessFamilyTracker {
+public:
+    std::vector<std::size_t> Update(
+        const std::vector<ProcessSample>& processes,
+        const std::vector<GameProfile>& profiles,
+        std::uint64_t nowMilliseconds);
+
+private:
+    struct Membership {
+        std::wstring profilePathKey;
+        std::uint64_t lastSeen = 0;
+    };
+    std::map<ProcessIdentity, Membership> members_;
+};
 
 enum class TdpTargetKind {
     Base,
