@@ -99,7 +99,8 @@ constexpr int IDC_BASE_SLOW_SPIN = 5055;
 constexpr int IDC_TDP_PRESET_FIRST = 5060;
 constexpr int IDC_MANAGE_PROFILES = 5070;
 constexpr int IDC_TDP_STATUS = 5071;
-constexpr int IDC_INFO_LINK = 5080;
+constexpr int IDC_INFO_REPOSITORY = 5080;
+constexpr int IDC_INFO_ICON_LICENSE = 5081;
 constexpr int IDC_PROFILE_LIST = 5100;
 constexpr int IDC_PROFILE_ADD = 5101;
 constexpr int IDC_PROFILE_EDIT = 5102;
@@ -412,6 +413,9 @@ bool BackendSetTdp(const LegionGoCore::TdpTriple& value, DWORD& code) {
                       std::to_wstring(value.fast) + L" " + std::to_wstring(value.slow), code) && code == 0;
 }
 
+std::wstring HResultText(HRESULT value) {
+    wchar_t text[32]{}; swprintf_s(text, L"0x%08X", static_cast<unsigned int>(value)); return text;
+}
 class BrightnessWmiSession final {
 public:
     ~BrightnessWmiSession() {
@@ -456,7 +460,7 @@ public:
     }
     bool Write(int brightness, std::wstring& error) {
         IWbemClassObject* instance = nullptr;
-        if (!FirstInstance(L"SELECT * FROM WmiMonitorBrightnessMethods WHERE Active=True", instance, error)) return false;
+        if (!FirstInstance(L"SELECT * FROM WmiMonitorBrightnessMethods", instance, error)) return false;
         VARIANT path{}; VariantInit(&path);
         HRESULT hr = instance->Get(L"__PATH", 0, &path, nullptr, nullptr);
         instance->Release();
@@ -468,17 +472,20 @@ public:
         if (SUCCEEDED(hr) && methodClass) hr = methodClass->GetMethod(methodName, 0, &definition, nullptr);
         if (SUCCEEDED(hr) && definition) hr = definition->SpawnInstance(0, &input);
         if (SUCCEEDED(hr) && input) {
-            VARIANT timeout{}; VariantInit(&timeout); timeout.vt = VT_UI4; timeout.ulVal = 0;
-            hr = input->Put(L"Timeout", 0, &timeout, 0); VariantClear(&timeout);
+            // WmiSetBrightness declares Timeout as CIM_UINT32, but the working
+            // Windows WMI provider convention is a VT_UI1 value plus the
+            // explicit CIM type (matching Microsoft's provider clients).
+            VARIANT timeout{}; VariantInit(&timeout); timeout.vt = VT_UI1; timeout.bVal = 0;
+            hr = input->Put(L"Timeout", 0, &timeout, CIM_UINT32); VariantClear(&timeout);
         }
         if (SUCCEEDED(hr) && input) {
             VARIANT level{}; VariantInit(&level); level.vt = VT_UI1; level.bVal = static_cast<BYTE>(brightness);
-            hr = input->Put(L"Brightness", 0, &level, 0); VariantClear(&level);
+            hr = input->Put(L"Brightness", 0, &level, CIM_UINT8); VariantClear(&level);
         }
         if (SUCCEEDED(hr)) hr = services_->ExecMethod(path.bstrVal, methodName, 0, nullptr, input, &output, nullptr);
         SysFreeString(methodName); VariantClear(&path);
         if (output) output->Release(); if (input) input->Release(); if (definition) definition->Release(); if (methodClass) methodClass->Release();
-        if (FAILED(hr)) { error = L"Windows could not set screen brightness"; return false; }
+        if (FAILED(hr)) { error = L"Windows could not set screen brightness (HRESULT " + HResultText(hr) + L")"; return false; }
         int actual = 0;
         if (!Read(actual, error)) return false;
         brightness_ = actual;
@@ -765,6 +772,8 @@ struct RuntimeStatus {
     bool brightnessKnown = false;
     int brightness = 50;
     std::wstring brightnessError;
+    unsigned brightnessSetSequence = 0;
+    bool brightnessSetOk = true;
 };
 std::mutex g_workerMutex;
 std::condition_variable g_workerCondition;
@@ -848,7 +857,8 @@ void WorkerMain() {
                 status.brightnessKnown = ok;
                 status.brightness = actual;
                 status.brightnessError = ok ? L"" : error;
-                if (!ok) Log(L"Brightness operation failed: " + error);
+                if (job == WorkerJob::BrightnessSet) { ++status.brightnessSetSequence; status.brightnessSetOk = ok; }
+                if (!ok) LogAlways(L"Brightness operation failed: " + error);
             }
         }
         if (stopRequested) break;
@@ -912,7 +922,15 @@ void WorkerMain() {
     else Log(L"Base TDP restored during shutdown.");
 }
 void QueueWorker(WorkerJob job) {
-    { std::lock_guard<std::mutex> lock(g_workerMutex); if (!g_workerStop) g_workerJobs.push_back(job); }
+    {
+        std::lock_guard<std::mutex> lock(g_workerMutex);
+        if (g_workerStop) return;
+        // Slider movement can emit many notifications. Keep at most one queued
+        // brightness write; it always consumes the latest atomic value.
+        if (job != WorkerJob::BrightnessSet ||
+            std::find(g_workerJobs.begin(), g_workerJobs.end(), WorkerJob::BrightnessSet) == g_workerJobs.end())
+            g_workerJobs.push_back(job);
+    }
     g_workerCondition.notify_one();
 }
 void StartWorker() {
@@ -1114,7 +1132,7 @@ bool ApplySettings(HWND hwnd) {
 }
 
 void CreateSettingsControls(HWND hwnd, SettingsState& state) {
-    HWND tab = Control(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP | TCS_FIXEDWIDTH, 12, 12, 876, 548, IDC_TAB);
+    HWND tab = Control(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP | TCS_FIXEDWIDTH | TCS_OWNERDRAWFIXED, 12, 12, 876, 548, IDC_TAB);
     TCITEMW item{}; item.mask = TCIF_TEXT;
     wchar_t general[] = L"General", controller[] = L"Controller", tdp[] = L"TDP", info[] = L"Info";
     item.pszText = general; TabCtrl_InsertItem(tab, 0, &item); item.pszText = controller; TabCtrl_InsertItem(tab, 1, &item);
@@ -1176,20 +1194,24 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 2, hwnd, L"Balanced presets:", x, y + 125, 120, 22);
     const int presets[] = {5, 8, 10, 12, 16, 20, 25, 30};
     for (int index = 0; index < 8; ++index) PageField(state, 2, hwnd, L"BUTTON", (std::to_wstring(presets[index]) + L" W").c_str(), BS_PUSHBUTTON,
-                                                        x + (index % 4) * 82, y + 150 + (index / 4) * 36, 72, 28, IDC_TDP_PRESET_FIRST + index);
-    PageField(state, 2, hwnd, L"BUTTON", L"Manage game profiles...", BS_PUSHBUTTON, x, y + 240, 190, 30, IDC_MANAGE_PROFILES);
-    PageField(state, 2, hwnd, L"STATIC", L"", SS_LEFT, x, y + 295, 650, 45, IDC_TDP_STATUS);
+                                                        x + index * 82, y + 150, 72, 28, IDC_TDP_PRESET_FIRST + index);
+    PageField(state, 2, hwnd, L"BUTTON", L"Manage game profiles...", BS_PUSHBUTTON, x, y + 205, 190, 30, IDC_MANAGE_PROFILES);
+    PageField(state, 2, hwnd, L"STATIC", L"", SS_LEFT, x, y + 260, 790, 45, IDC_TDP_STATUS);
 
     Label(state, 3, hwnd, APP_VERSION, x, y, 760, 30);
     Label(state, 3, hwnd,
           L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, and automatically applies per-application TDP profiles while following launcher child processes.",
           x, y + 48, 790, 100);
-    PageField(state, 3, hwnd, WC_LINK,
-              L"<a href=\"https://github.com/terrornoize/LegionGoControl\">Open the LegionGoControl GitHub repository</a>\r\n\r\nApplication icon: Nintendo Switch by Nick Taras from The Noun Project (Creative Commons). <a href=\"https://thenounproject.com/icon/nintendo-switch-6146674/\">Icon and license page</a>",
-              WS_TABSTOP, x, y + 175, 790, 110, IDC_INFO_LINK);
+    Label(state, 3, hwnd, L"Repository:", x, y + 175, 120, 24);
+    PageField(state, 3, hwnd, L"BUTTON", L"Open GitHub repository", BS_PUSHBUTTON | WS_TABSTOP,
+              x, y + 205, 210, 34, IDC_INFO_REPOSITORY);
+    Label(state, 3, hwnd, REPOSITORY_URL, x + 230, y + 212, 540, 24);
+    Label(state, 3, hwnd, L"Application icon: Nintendo Switch by Nick Taras from The Noun Project (Creative Commons, attribution required).", x, y + 270, 790, 45);
+    PageField(state, 3, hwnd, L"BUTTON", L"Open icon and license page", BS_PUSHBUTTON | WS_TABSTOP,
+              x, y + 320, 230, 34, IDC_INFO_ICON_LICENSE);
     Label(state, 3, hwnd,
           L"This beta is hardware-specific. TDP, battery, HID and restore behavior must be validated on the actual Legion Go device.",
-          x, y + 315, 790, 55);
+          x, y + 390, 790, 55);
     ShowSettingsPage(hwnd, 0);
 }
 
@@ -1204,11 +1226,24 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             const NMHDR* header = reinterpret_cast<NMHDR*>(lParam);
             if (header && header->idFrom == IDC_TAB && header->code == TCN_SELCHANGE)
                 ShowSettingsPage(hwnd, TabCtrl_GetCurSel(header->hwndFrom));
-            else if (header && header->idFrom == IDC_INFO_LINK && (header->code == NM_CLICK || header->code == NM_RETURN)) {
-                const NMLINK* link = reinterpret_cast<const NMLINK*>(lParam);
-                if (link->item.szUrl[0]) ShellExecuteW(hwnd, L"open", link->item.szUrl, nullptr, nullptr, SW_SHOWNORMAL);
-            }
             return 0;
+        }
+        case WM_DRAWITEM: {
+            const DRAWITEMSTRUCT* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+            if (draw && draw->CtlID == IDC_TAB) {
+                const bool selected = (draw->itemState & ODS_SELECTED) != 0;
+                HBRUSH brush = CreateSolidBrush(selected ? RGB(244, 246, 249) : RGB(92, 98, 108));
+                FillRect(draw->hDC, &draw->rcItem, brush); DeleteObject(brush);
+                SetBkMode(draw->hDC, TRANSPARENT); SetTextColor(draw->hDC, selected ? RGB(24, 28, 34) : RGB(242, 244, 247));
+                SelectObject(draw->hDC, g_font);
+                wchar_t text[64]{}; TCITEMW item{}; item.mask = TCIF_TEXT; item.pszText = text; item.cchTextMax = static_cast<int>(_countof(text));
+                TabCtrl_GetItem(draw->hwndItem, static_cast<int>(draw->itemID), &item);
+                RECT textRect = draw->rcItem; DrawTextW(draw->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                FrameRect(draw->hDC, &draw->rcItem, GetSysColorBrush(COLOR_3DSHADOW));
+                if (draw->itemState & ODS_FOCUS) DrawFocusRect(draw->hDC, &draw->rcItem);
+                return TRUE;
+            }
+            return FALSE;
         }
         case WM_HSCROLL: {
             SettingsState* state = SettingsData(hwnd);
@@ -1217,9 +1252,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                 SetText(hwnd, IDC_BRIGHTNESS_VALUE, std::to_wstring(position) + L"%");
                 const int notification = LOWORD(wParam);
                 state->brightnessDragging = notification == TB_THUMBTRACK;
-                if (notification != TB_THUMBTRACK) {
-                    g_requestedBrightness.store(position); QueueWorker(WorkerJob::BrightnessSet);
-                }
+                g_requestedBrightness.store(position);
+                QueueWorker(WorkerJob::BrightnessSet);
                 return 0;
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -1230,6 +1264,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             else if (id == IDC_CANCEL) { PopulateSettings(hwnd); ShowWindow(hwnd, SW_HIDE); }
             else if (id == IDC_APPLY) ApplySettings(hwnd);
             else if (id == IDC_OPEN_LOG) { LogAlways(L"Log opened."); ShellExecuteW(hwnd, L"open", g_logPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+            else if (id == IDC_INFO_REPOSITORY) ShellExecuteW(hwnd, L"open", REPOSITORY_URL, nullptr, nullptr, SW_SHOWNORMAL);
+            else if (id == IDC_INFO_ICON_LICENSE) ShellExecuteW(hwnd, L"open", L"https://thenounproject.com/icon/nintendo-switch-6146674/", nullptr, nullptr, SW_SHOWNORMAL);
             else if (id == IDC_BATTERY && notification == BN_CLICKED) {
                 EnableWindow(GetDlgItem(hwnd, IDC_BATTERY), FALSE);
                 SetText(hwnd, IDC_BATTERY_STATUS, L"Applying and verifying...");
@@ -1287,7 +1323,7 @@ void UpdateSettingsRuntime() {
         if (slider && status.brightnessKnown) SendMessageW(slider, TBM_SETPOS, TRUE, status.brightness);
         SetText(g_settings, IDC_BRIGHTNESS_VALUE,
                 status.brightnessKnown ? std::to_wstring(status.brightness) + L"%"
-                                       : (status.brightnessError.empty() ? L"Unavailable" : status.brightnessError));
+                                       : (status.brightnessError.empty() ? L"Unavailable" : L"Set failed - see log"));
     }
 }
 void ShowSettings(int tab) {
@@ -1487,6 +1523,7 @@ bool AddTrayIcon(HWND hwnd) {
     g_nid.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &g_nid); return result;
 }
 unsigned g_presentedBatteryToggleSequence = 0;
+unsigned g_presentedBrightnessSetSequence = 0;
 void UpdateTrayTip() {
     const RuntimeStatus status = RuntimeSnapshot(); std::wstring tip = status.profileActive ? L"Active: " + status.profileName : L"Active: Base";
     tip += L" (STAPM " + std::to_wstring(status.desired.stapm) + L" / SLOW " +
@@ -1496,6 +1533,11 @@ void UpdateTrayTip() {
         g_presentedBatteryToggleSequence = status.batteryToggleSequence;
         if (!status.batteryToggleOk) Balloon(status.battery.error.empty() ? L"Battery limit operation failed." : status.battery.error, NIIF_ERROR);
         else Balloon(status.battery.known ? (status.battery.enabled ? L"Battery limit 80% enabled." : L"Battery limit 80% disabled.") : L"Battery limit toggled.");
+    }
+    if (status.brightnessSetSequence != g_presentedBrightnessSetSequence) {
+        g_presentedBrightnessSetSequence = status.brightnessSetSequence;
+        if (!status.brightnessSetOk)
+            Balloon(L"Screen brightness could not be changed. Details were written to LegionGoControl.log.", NIIF_ERROR);
     }
 }
 void ShowTrayMenu(HWND hwnd) {
@@ -1580,7 +1622,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         HWND existing = FindWindowW(HIDDEN_CLASS, nullptr); if (existing) PostMessageW(existing, WMAPP_SHOW_SETTINGS, 2, 0);
         CloseHandle(g_singleton); g_singleton = nullptr; return 0;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_UPDOWN_CLASS | ICC_BAR_CLASSES | ICC_LINK_CLASS}; InitCommonControlsEx(&controls);
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_UPDOWN_CLASS | ICC_BAR_CLASSES}; InitCommonControlsEx(&controls);
     const UINT dpi = SystemDpi();
     g_font = CreateFontW(-MulDiv(10, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
