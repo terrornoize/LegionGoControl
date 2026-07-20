@@ -1,6 +1,6 @@
 # LegionGoControl V2.1 (beta)
 
-LegionGoControl is a native Windows tray utility for the **Lenovo Legion Go 1 / 8APU1 / Z1 Extreme**. V2.1 adds a graphical settings interface, per-executable TDP profiles and a firmware fan-curve editor while keeping the original Raw Input button mapper and Lenovo WMI backend.
+LegionGoControl is a native Windows tray utility for the **Lenovo Legion Go 1 / 8APU1 / Z1 Extreme**. V2.1 adds a graphical settings interface, per-executable TDP profiles, named firmware fan-curve profiles and an autonomous performance overlay while keeping the original Raw Input button mapper and Lenovo WMI backend.
 
 > **Hardware beta:** fan telemetry, curve read/write/read-back and restore have been tested remotely on model `83E1 / Legion Go 8APU1`, BIOS `N3CN37WW`. Lenovo HID, TDP and battery behavior still require target-device validation before daily use, and other BIOS versions remain unverified.
 
@@ -11,7 +11,11 @@ LegionGoControl.exe
 ├─ tray and Settings UI
 ├─ Legion Go Raw Input mapper
 ├─ process monitor and Game Profiles resolver
+├─ click-through performance overlay and native metric collectors
 └─ serialized calls to the backend
+
+PresentMon.exe
+└─ bundled MIT-licensed ETW collector for FPS and frame timing
 
 LegionGoNativeWmiProbe.exe
 ├─ Lenovo WMI access through ROOT\WMI / LENOVO_OTHER_METHOD / LENOVO_FAN_METHOD
@@ -20,14 +24,14 @@ LegionGoNativeWmiProbe.exe
 └─ verified battery-limit status/set/toggle
 ```
 
-Both executables must remain in the same directory.
+All three executables must remain in the same directory. PresentMon attribution and license are under `third_party/PresentMon`.
 
 ## Tray menu
 
 The V2.1 tray is intentionally small:
 
 - **Open TDP setter** — opens the TDP tab in Settings;
-- **Settings...** — opens General, Controller, TDP, Fan and Info settings;
+- **Settings...** — opens General, Controller, TDP, Fan, Overlay and Info settings;
 - **Game Profiles...** — manages per-executable TDP profiles;
 - version header (`LegionGoControl v2.1 YYYYMMDD`) and active target status;
 - **Exit**.
@@ -93,9 +97,33 @@ Balanced preset buttons set all three values to the same wattage. The base targe
 
 The Fan tab provides a DPI-aware graph with ten draggable firmware nodes. Temperatures are fixed by the Legion Go firmware at `10, 20, ... 100 °C`; each node controls duty percent and shows an RPM estimate based on hardware calibration. The tab reads actual CPU temperature and fan RPM once per second while open, and displays the interpolated curve command percentage.
 
+Named curves are managed from the profile combo above the graph. **New** copies the current curve into a new draft, **Save** immediately stores the current name and curve, and **Delete** removes the selected draft when Settings is applied. Selecting another profile loads its ten points. Apply/OK also persists all profile changes and records the selected profile.
+
 Curve writes are explicit, validated, read back exactly and rolled back on failure. The backend preserves the original firmware curve on the first apply and restores it when custom control is disabled or LegionGoControl exits cleanly. Safety floors prevent decreasing curves and require at least `60% @ 80 °C`, `80% @ 90 °C`, and `85% @ 100 °C`. Firmware emergency protection always retains priority.
 
 Hardware observations on BIOS `N3CN37WW`: `28%` stabilized near `2100 RPM`; `84%` stabilized near `6280 RPM`; firmware ramps speed changes gradually rather than stepping immediately.
+
+### Overlay
+
+The Overlay tab configures an autonomous RTSS-style panel. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), opacity (`30-100%`), screen corner and X/Y margins are configurable; DPI and monitor resolution are also considered automatically.
+
+Metrics update once per second and are rendered in this fixed order:
+
+1. FPS;
+2. frame time and rolling frame-time graph;
+3. CPU usage;
+4. CPU temperature;
+5. CPU package power;
+6. GPU usage;
+7. VRAM used / configured total;
+8. free RAM / total RAM;
+9. fan RPM;
+10. remaining battery percentage;
+11. local time in 24-hour format.
+
+FPS and frame timing come from the bundled open-source PresentMon 2.5.1 ETW collector. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
+
+Because the overlay deliberately avoids game injection, a protected game or true exclusive-fullscreen presentation may cover it. Borderless/windowed fullscreen is the most compatible mode.
 
 ## Game Profiles
 
@@ -165,9 +193,27 @@ Fan preferences use:
 ```ini
 [Fan]
 Enabled=0
+SelectedProfile={fan-guid-1}
 Duty0=44
 Duty1=48
 ; ... Duty9, corresponding to 10..100 C
+
+[FanProfiles]
+Order={fan-guid-1},{fan-guid-2}
+
+[FanProfile.{fan-guid-1}]
+Name=Balanced
+Duty0=44
+; ... Duty9
+
+[Overlay]
+VisibleAtStartup=0
+FunctionKey=10
+ScalePercent=100
+OpacityPercent=85
+Corner=1
+MarginX=20
+MarginY=20
 ```
 
 Unknown INI keys and sections are not intentionally rewritten or deleted.
@@ -221,6 +267,8 @@ LegionGoNativeWmiProbe_state.txt
 LegionGoBatteryLimitState.txt
 LegionGoFanState.txt
 LegionGoFanBackup.txt
+PresentMon.exe
+PresentMon-LICENSE.txt
 ```
 
 For V2.1 beta testing, use a directory writable only by the intended administrator account. The frontend currently still runs elevated, so controller `launch` actions inherit elevated privileges.
@@ -244,6 +292,7 @@ Outputs:
 ```text
 LegionGoControl.exe
 LegionGoNativeWmiProbe.exe
+PresentMon.exe
 build\LegionGoCoreTests.exe
 ```
 
@@ -268,7 +317,7 @@ The tests never invoke WMI, change TDP, toggle battery state or launch the tray 
 
 ## Install / startup
 
-Place both executables in a protected directory, for example:
+Place all three executables in a protected directory, for example:
 
 ```text
 C:\NoInstall\LegionGoControl
@@ -291,6 +340,9 @@ Before daily use, validate on the actual device:
 7. Closing the final executable restores the exact base triple.
 8. Suspend/resume, app restart and forced game termination do not leave an unwanted target active.
 9. Backend timeout/failure is shown as an error and does not claim success.
+10. Fan profiles survive restart and selecting each profile restores its ten saved points.
+11. The overlay hotkey toggles without focusing it; values refresh once per second and clicks pass through to the game.
+12. Compare FPS/frame time with PresentMon output and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
 
 ## Safety
 
