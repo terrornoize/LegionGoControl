@@ -12,7 +12,7 @@ LegionGoControl.exe
 ├─ Legion Go Raw Input mapper
 ├─ process monitor and Game Profiles resolver
 ├─ click-through performance overlay and native metric collectors
-├─ verified AMD FRTC frame limiter with crash recovery
+├─ verified AMD Radeon Chill frame limiter with crash recovery
 └─ serialized calls to the Lenovo backend
 
 LegionGoNativeWmiProbe.exe
@@ -103,14 +103,14 @@ Hardware observations on BIOS `N3CN37WW`: `28%` stabilized near `2100 RPM`; `84%
 
 ### Overlay
 
-The Overlay tab configures an autonomous RTSS-style display. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), opacity (`30-100%`), screen corner and X/Y margins are configurable; DPI and monitor resolution are also considered automatically.
+The Overlay tab configures an autonomous RTSS-style display. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), black overlay opacity (`0-100%`, background and text fade together), screen corner and X/Y margins are configurable; DPI and monitor resolution are also considered automatically.
 
 Two layouts are available: the original vertical panel and a compact full-width top performance bar. The top bar follows the fixed colored labels `FPS`, `Z1E`, `780M`, `RAM`, `FAN`, `BATT`, followed by the 24-hour clock.
 
 Metrics update once per second and are rendered in this fixed order:
 
 1. FPS;
-2. frame time and rolling frame-time graph;
+2. rolling frame-pacing graph (numeric frame time is currently hidden);
 3. CPU usage;
 4. CPU temperature;
 5. CPU package power;
@@ -121,15 +121,15 @@ Metrics update once per second and are rendered in this fixed order:
 10. remaining battery percentage;
 11. local time in 24-hour format.
 
-FPS and frame timing come directly from real-time `Microsoft-Windows-DXGI` and `Microsoft-Windows-D3D9` ETW `Present_Start` events. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
+FPS and frame pacing come directly from real-time `Microsoft-Windows-DXGI` and `Microsoft-Windows-D3D9` ETW `Present_Start` events. FPS is suppressed when the Windows desktop or taskbar is foreground, avoiding a misleading shell/display-refresh value. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
 
 Because the overlay deliberately avoids game injection, a protected game or true exclusive-fullscreen presentation may cover it. Borderless/windowed fullscreen is the most compatible mode.
 
 ### FPS limiter
 
-Settings > General provides a base FPS limiter from `30` to `144 FPS`. Each Game Profile can optionally override that base target with its own `30-144 FPS` slider. The limiter uses the AMD driver-provided Frame Rate Target Control (FRTC) interface in `amdadlx64.dll`; it does not use RTSS, process suspension or game injection.
+Settings > General provides a base FPS limiter from `30` to `144 FPS`. Each Game Profile can optionally override that base target with its own `30-144 FPS` slider. The limiter uses the AMD driver-provided Radeon Chill interface in `amdadlx64.dll`, setting Chill minimum and maximum to the same target; it does not use RTSS, process suspension or game injection.
 
-Before the first change LegionGoControl stores the previous Radeon FRTC enabled state and FPS value. Every change is read back through the driver. The original Radeon state is restored on clean exit, and a persistent backup enables recovery after a crash or forced termination. On the tested Radeon 780M driver FRTC reports support with a native `15-1000 FPS` range; LegionGoControl intentionally exposes only `30-144 FPS`.
+Before the first change LegionGoControl stores the previous Radeon Chill enabled state and both minimum/maximum FPS values. Every change is read back through the driver. The original Radeon state is restored when limiting is disabled and on clean exit, while a persistent backup enables recovery after a crash or forced termination. On the tested Radeon 780M driver Chill reports a native `30-300 FPS` range; LegionGoControl intentionally exposes only `30-144 FPS`.
 
 ## Game Profiles
 
@@ -353,8 +353,8 @@ Before daily use, validate on the actual device:
 9. Backend timeout/failure is shown as an error and does not claim success.
 10. Fan profiles survive restart and selecting each profile restores its ten saved points.
 11. The overlay hotkey toggles without focusing it; values refresh once per second and clicks pass through to the game.
-12. Compare FPS/frame time with another trusted counter and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
-13. Enable a harmless 60 FPS base limit, verify AMD FRTC read-back, disable it, and confirm the previous Radeon state is restored.
+12. Compare FPS/pacing graph with another trusted counter and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
+13. Enable a harmless 60 FPS base limit, verify AMD Radeon Chill min/max read-back, disable it, and confirm the previous Radeon state is restored.
 14. Configure a different Game Profile FPS target and verify base/profile switching and final restore.
 
 ## Safety

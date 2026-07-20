@@ -74,11 +74,22 @@ struct FrameSample {
     SteadyClock::time_point received{};
 };
 
+bool IsWindowsDesktopForeground(HWND window) {
+    if (window == nullptr) return true;
+    const HWND root = GetAncestor(window, GA_ROOT);
+    const HWND shell = GetShellWindow();
+    if (window == shell || root == shell || window == GetDesktopWindow()) return true;
+    wchar_t className[128]{};
+    GetClassNameW(root != nullptr ? root : window, className, static_cast<int>(_countof(className)));
+    return _wcsicmp(className, L"Progman") == 0 || _wcsicmp(className, L"WorkerW") == 0 ||
+           _wcsicmp(className, L"Shell_TrayWnd") == 0 || _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0;
+}
+
 Config SanitizeConfig(const Config& input) {
     Config result = input;
     result.functionKey = (std::max)(1, (std::min)(24, result.functionKey));
     result.scalePercent = (std::max)(50, (std::min)(200, result.scalePercent));
-    result.opacityPercent = (std::max)(30, (std::min)(100, result.opacityPercent));
+    result.opacityPercent = (std::max)(0, (std::min)(100, result.opacityPercent));
     result.corner = (std::max)(0, (std::min)(3, result.corner));
     result.layoutStyle = (std::max)(0, (std::min)(1, result.layoutStyle));
     result.marginX = (std::max)(0, (std::min)(10000, result.marginX));
@@ -590,7 +601,7 @@ private:
         }
         activeFunctionKey_ = 0;
         activeHotKeyId_ = kHotKeyIdA;
-        foregroundProcessId_.store(0U);
+        foregroundState_.store(1ULL << 32U);
         {
             std::lock_guard<std::mutex> firmwareLock(firmwareMutex_);
             firmwareTemperatureC_ = 0;
@@ -638,6 +649,9 @@ private:
             }
         }
 
+        // Opacity is intentionally applied to the complete black overlay:
+        // 0% is fully transparent and 100% is opaque black with opaque text.
+        // Intermediate values fade the background and lettering together.
         const BYTE alpha = static_cast<BYTE>((config.opacityPercent * 255 + 50) / 100);
         SetLayeredWindowAttributes(window_, 0U, alpha, LWA_ALPHA);
         UpdateWindowLayout();
@@ -710,7 +724,8 @@ private:
         if (target != nullptr) {
             GetWindowThreadProcessId(target, &targetProcessId);
         }
-        foregroundProcessId_.store(targetProcessId);
+        foregroundState_.store((IsWindowsDesktopForeground(target) ? (1ULL << 32U) : 0ULL) |
+                               static_cast<unsigned long long>(targetProcessId));
         HMONITOR monitor = MonitorFromWindow(target != nullptr ? target : window_, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO information{};
         information.cbSize = sizeof(information);
@@ -789,7 +804,7 @@ private:
             return L"N/A";
         }
         wchar_t buffer[64]{};
-        if (swprintf_s(buffer, L"%.1f/%.1fGB", used.value / kBytesPerGiB,
+        if (swprintf_s(buffer, L"%.1f / %.1f GB", used.value / kBytesPerGiB,
                        total.value / kBytesPerGiB) < 0) {
             return L"N/A";
         }
@@ -816,7 +831,7 @@ private:
             targetDc = bufferDc;
         }
 
-        HBRUSH background = CreateSolidBrush(RGB(14, 17, 22));
+        HBRUSH background = CreateSolidBrush(RGB(0, 0, 0));
         FillRect(targetDc, &client, background != nullptr ? background :
                  static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         if (background != nullptr) {
@@ -872,9 +887,9 @@ private:
             const COLORREF white = RGB(242, 246, 250);
             const int requestedPadding = (std::max)(3, static_cast<int>(std::lround(8.0 * textScale)));
             const int padding = (std::min)(requestedPadding, (std::max)(0, (width - 1) / 2));
-            const int gap = (std::max)(2, static_cast<int>(std::lround(5.0 * textScale)));
+            const int gap = (std::max)(4, static_cast<int>(std::lround(10.0 * textScale)));
             const int usableWidth = (std::max)(1, width - (2 * padding));
-            const int weights[7]{21, 18, 19, 14, 12, 8, 8};
+            const int weights[7]{13, 20, 21, 15, 12, 10, 9};
             RECT segments[7]{};
             int segmentLeft = padding;
             int accumulatedWeight = 0;
@@ -909,8 +924,9 @@ private:
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             };
 
-            const std::wstring fpsValue = FormatNumber(snapshot.fps, L"%.0f") + L" " +
-                                          FormatNumber(snapshot.frameTimeMs, L"%.1fms");
+            // Numeric frame time is intentionally hidden for now. The compact
+            // graph remains available as the immediate pacing indicator.
+            const std::wstring fpsValue = FormatNumber(snapshot.fps, L"%.0f");
             RECT fpsRect = segments[0];
             const int fpsWidth = static_cast<int>(fpsRect.right - fpsRect.left);
             const int fpsInset = (std::min)(gap, (std::max)(0, fpsWidth / 2));
@@ -933,12 +949,12 @@ private:
                            height - (std::max)(2, static_cast<int>(std::lround(9.0 * textScale)))};
             PaintMiniGraph(targetDc, miniGraph, snapshot.frameHistory, textScale, yellow);
 
-            const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + L" " +
-                (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + L" " +
+            const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + L"  " +
+                (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + L"  " +
                 FormatNumber(snapshot.powerWatts, L"%.1fW");
             const NumericMetric& vramTotal = snapshot.vramCapacityBytes.known ?
                 snapshot.vramCapacityBytes : snapshot.vramBudgetBytes;
-            const std::wstring gpuValue = FormatNumber(snapshot.gpuPercent, L"%.0f%%") + L" " +
+            const std::wstring gpuValue = FormatNumber(snapshot.gpuPercent, L"%.0f%%") + L"  " +
                                           FormatCompactMemory(snapshot.vramUsedBytes, vramTotal);
             drawPair(segments[1], L"Z1E", orange, cpuValue);
             drawPair(segments[2], L"780M", green, gpuValue);
@@ -959,7 +975,6 @@ private:
             // Keep this order synchronized with the documented RTSS-style layout.
             const std::vector<std::pair<std::wstring, std::wstring>> rows{
                 {L"FPS", FormatNumber(snapshot.fps, L"%.1f")},
-                {L"FRAME TIME", FormatNumber(snapshot.frameTimeMs, L"%.1f ms")},
                 {L"CPU USAGE", FormatNumber(snapshot.cpuPercent, L"%.0f%%")},
                 {L"CPU TEMP", temperature},
                 {L"CPU POWER", FormatNumber(snapshot.powerWatts, L"%.1f W")},
@@ -988,7 +1003,7 @@ private:
                 DrawTextW(targetDc, rows[index].second.c_str(), -1, &valueRect,
                           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
                 y += rowHeight;
-                if (index == 1U) {
+                if (index == 0U) {
                     RECT graphRect{padding, y, width - padding, (std::min)(height - padding, y + graphHeight)};
                     PaintGraph(targetDc, graphRect, snapshot.frameHistory, scale);
                     y += graphHeight;
@@ -1191,7 +1206,13 @@ private:
         // Retain an overlap across one-second publications so a short ETW
         // scheduling gap does not make otherwise continuous presents blink.
         const SteadyClock::time_point rollingStart = now - std::chrono::milliseconds(2500);
-        const DWORD foregroundProcess = foregroundProcessId_.load();
+        const unsigned long long foregroundState = foregroundState_.load();
+        if ((foregroundState & (1ULL << 32U)) != 0U) {
+            frameSamplesByProcess_.clear();
+            selectedFrameProcessId_ = 0U;
+            return;
+        }
+        const DWORD foregroundProcess = static_cast<DWORD>(foregroundState & 0xffffffffULL);
         DWORD targetProcess = 0U;
         const auto foregroundSamples = frameSamplesByProcess_.find(foregroundProcess);
         if (foregroundSamples != frameSamplesByProcess_.end()) {
@@ -1376,7 +1397,8 @@ private:
             if (observedForegroundWindow != nullptr) {
                 GetWindowThreadProcessId(observedForegroundWindow, &observedForegroundProcess);
             }
-            foregroundProcessId_.store(observedForegroundProcess);
+            foregroundState_.store((IsWindowsDesktopForeground(observedForegroundWindow) ? (1ULL << 32U) : 0ULL) |
+                                   static_cast<unsigned long long>(observedForegroundProcess));
             const SteadyClock::time_point now = SteadyClock::now();
 
             if (!presentTrace.Running() && now >= nextPresentTraceStart) {
@@ -1414,7 +1436,8 @@ private:
     mutable std::mutex firmwareMutex_;
     std::atomic<bool> initialized_{false};
     std::atomic<bool> visible_{false};
-    std::atomic<DWORD> foregroundProcessId_{0U};
+    // Low 32 bits: PID. Bit 32: Windows desktop/taskbar foreground.
+    std::atomic<unsigned long long> foregroundState_{1ULL << 32U};
     HINSTANCE instance_ = nullptr;
     HWND window_ = nullptr;
     ATOM classAtom_ = 0U;

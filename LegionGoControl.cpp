@@ -273,12 +273,13 @@ void IniWriteInt(const wchar_t* section, const wchar_t* key, int value) {
 bool FpsBackupActive() {
     return GetPrivateProfileIntW(L"Backup", L"Active", 0, g_fpsBackupPath.c_str()) != 0;
 }
-bool WriteFpsBackup(bool active, bool enabled, int fps) {
+bool WriteFpsBackup(bool active, bool enabled, int minFps, int maxFps) {
     const auto write = [&](const wchar_t* key, const std::wstring& value) {
         return WritePrivateProfileStringW(L"Backup", key, value.c_str(), g_fpsBackupPath.c_str()) != FALSE;
     };
-    if (!write(L"Enabled", enabled ? L"1" : L"0") || !write(L"FPS", std::to_wstring(fps)) ||
-        !write(L"Active", active ? L"1" : L"0")) return false;
+    if (!write(L"Backend", L"Chill") || !write(L"Enabled", enabled ? L"1" : L"0") ||
+        !write(L"MinFPS", std::to_wstring(minFps)) || !write(L"MaxFPS", std::to_wstring(maxFps)) ||
+        !write(L"FPS", std::to_wstring(maxFps)) || !write(L"Active", active ? L"1" : L"0")) return false;
     // Flush is best-effort: the profile API may return FALSE when no cached
     // mapping exists even though all three writes above succeeded.
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_fpsBackupPath.c_str());
@@ -288,7 +289,7 @@ bool EnsureFpsBackup(std::wstring& error) {
     if (FpsBackupActive()) return true;
     const LegionGoFrameLimiter::State current = LegionGoFrameLimiter::Query();
     if (!current.available || !current.supported) { error = current.error; return false; }
-    if (!WriteFpsBackup(true, current.enabled, current.fps)) { error = L"FPS backup could not be written"; return false; }
+    if (!WriteFpsBackup(true, current.enabled, current.minFps, current.maxFps)) { error = L"FPS backup could not be written"; return false; }
     return true;
 }
 bool ApplyFpsTarget(bool enabled, int fps, std::wstring& error) {
@@ -300,23 +301,44 @@ bool ApplyFpsTarget(bool enabled, int fps, std::wstring& error) {
 }
 bool RestoreFpsBackup(std::wstring& error) {
     if (!FpsBackupActive()) { error.clear(); return true; }
-    wchar_t enabledText[16]{}, fpsText[32]{};
+    wchar_t backendText[32]{}, enabledText[16]{}, legacyFpsText[32]{}, minFpsText[32]{}, maxFpsText[32]{};
+    GetPrivateProfileStringW(L"Backup", L"Backend", L"", backendText, _countof(backendText), g_fpsBackupPath.c_str());
     GetPrivateProfileStringW(L"Backup", L"Enabled", L"", enabledText, _countof(enabledText), g_fpsBackupPath.c_str());
-    GetPrivateProfileStringW(L"Backup", L"FPS", L"", fpsText, _countof(fpsText), g_fpsBackupPath.c_str());
-    wchar_t* fpsEnd = nullptr;
-    const long parsedFps = wcstol(fpsText, &fpsEnd, 10);
-    if ((wcscmp(enabledText, L"0") != 0 && wcscmp(enabledText, L"1") != 0) ||
-        fpsEnd == fpsText || *fpsEnd != L'\0' || parsedFps < 1 || parsedFps > 1000) {
+    GetPrivateProfileStringW(L"Backup", L"FPS", L"", legacyFpsText, _countof(legacyFpsText), g_fpsBackupPath.c_str());
+    GetPrivateProfileStringW(L"Backup", L"MinFPS", L"", minFpsText, _countof(minFpsText), g_fpsBackupPath.c_str());
+    GetPrivateProfileStringW(L"Backup", L"MaxFPS", L"", maxFpsText, _countof(maxFpsText), g_fpsBackupPath.c_str());
+    const auto parseFps = [](const wchar_t* text, int& value) {
+        wchar_t* end = nullptr; const long parsed = wcstol(text, &end, 10);
+        if (end == text || *end != L'\0' || parsed < 1 || parsed > 1000) return false;
+        value = static_cast<int>(parsed); return true;
+    };
+    const bool enabledValid = wcscmp(enabledText, L"0") == 0 || wcscmp(enabledText, L"1") == 0;
+    const bool enabled = wcscmp(enabledText, L"1") == 0;
+    int legacyFps = 0;
+    if (backendText[0] == L'\0') {
+        if (!enabledValid || !parseFps(legacyFpsText, legacyFps)) {
+            error = L"Legacy FRTC backup is incomplete or invalid; Radeon state was not changed";
+            return false;
+        }
+        bool restoredLegacy = LegionGoFrameLimiter::RestoreLegacyFrtc(enabled, legacyFps, error);
+        if (!restoredLegacy) restoredLegacy = LegionGoFrameLimiter::RestoreLegacyFrtc(enabled, legacyFps, error);
+        if (!restoredLegacy) return false;
+        if (WritePrivateProfileStringW(L"Backup", L"Active", L"0", g_fpsBackupPath.c_str()) == FALSE) {
+            error = L"Legacy FRTC restore verified but backup marker cleanup failed"; return false;
+        }
+        error.clear(); return true;
+    }
+    int minFps = 0, maxFps = 0;
+    if (_wcsicmp(backendText, L"Chill") != 0 || !enabledValid ||
+        !parseFps(minFpsText, minFps) || !parseFps(maxFpsText, maxFps) || minFps > maxFps) {
         error = L"FPS backup is incomplete or invalid; Radeon state was not changed";
         return false;
     }
-    const bool enabled = wcscmp(enabledText, L"1") == 0;
-    const int fps = static_cast<int>(parsedFps);
     LegionGoFrameLimiter::State verified;
-    bool restored = LegionGoFrameLimiter::Set(enabled, fps, verified);
-    if (!restored) restored = LegionGoFrameLimiter::Set(enabled, fps, verified);
+    bool restored = LegionGoFrameLimiter::SetState(enabled, minFps, maxFps, verified);
+    if (!restored) restored = LegionGoFrameLimiter::SetState(enabled, minFps, maxFps, verified);
     if (!restored) { error = verified.error; return false; }
-    if (!WriteFpsBackup(false, enabled, fps)) { error = L"FPS restore verified but backup marker cleanup failed"; return false; }
+    if (!WriteFpsBackup(false, enabled, minFps, maxFps)) { error = L"FPS restore verified but backup marker cleanup failed"; return false; }
     error.clear(); return true;
 }
 
@@ -871,7 +893,7 @@ void LoadConfiguration() {
     overlay.enabledAtStartup = IniInt(L"Overlay", L"VisibleAtStartup", 0) != 0;
     overlay.functionKey = (std::max)(1, (std::min)(24, IniInt(L"Overlay", L"FunctionKey", 10)));
     overlay.scalePercent = (std::max)(50, (std::min)(200, IniInt(L"Overlay", L"ScalePercent", 100)));
-    overlay.opacityPercent = (std::max)(30, (std::min)(100, IniInt(L"Overlay", L"OpacityPercent", 85)));
+    overlay.opacityPercent = (std::max)(0, (std::min)(100, IniInt(L"Overlay", L"OpacityPercent", 85)));
     overlay.corner = (std::max)(0, (std::min)(3, IniInt(L"Overlay", L"Corner", 1)));
     overlay.marginX = (std::max)(0, (std::min)(500, IniInt(L"Overlay", L"MarginX", 20)));
     overlay.marginY = (std::max)(0, (std::min)(500, IniInt(L"Overlay", L"MarginY", 20)));
@@ -1619,7 +1641,7 @@ bool ApplySettings(HWND hwnd) {
         Message(hwnd, L"Overlay", L"Overlay margins must be between 0 and 500.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 4); return false;
     }
     if (overlay.functionKey < 1 || overlay.functionKey > 24 || overlay.scalePercent < 50 || overlay.scalePercent > 200 ||
-        overlay.opacityPercent < 30 || overlay.opacityPercent > 100 || overlay.corner < 0 || overlay.corner > 3 ||
+        overlay.opacityPercent < 0 || overlay.opacityPercent > 100 || overlay.corner < 0 || overlay.corner > 3 ||
         overlay.layoutStyle < 0 || overlay.layoutStyle > 1) {
         Message(hwnd, L"Overlay", L"Overlay settings are invalid.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 4); return false;
     }
@@ -1697,13 +1719,13 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     HWND cooldownSpin = PageField(state, 0, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 292, y + 218, 22, 26, IDC_COOLDOWN_SPIN);
     ConfigureSpinner(cooldownSpin, cooldownEdit, 50, 5000);
     PageField(state, 0, hwnd, L"BUTTON", L"Open log", BS_PUSHBUTTON, x, y + 275, 110, 28, IDC_OPEN_LOG);
-    PageField(state, 0, hwnd, L"BUTTON", L"Enable base FPS limit (AMD FRTC)", BS_AUTOCHECKBOX | WS_TABSTOP,
+    PageField(state, 0, hwnd, L"BUTTON", L"Enable base FPS limit (AMD Radeon Chill)", BS_AUTOCHECKBOX | WS_TABSTOP,
               x, y + 325, 280, 26, IDC_FPS_LIMIT_ENABLE);
     HWND fpsLimit = PageField(state, 0, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
                               x + 285, y + 317, 360, 40, IDC_FPS_LIMIT);
     SendMessageW(fpsLimit, TBM_SETRANGE, TRUE, MAKELONG(30, 144)); SendMessageW(fpsLimit, TBM_SETTICFREQ, 6, 0);
     PageField(state, 0, hwnd, L"STATIC", L"60 FPS", SS_LEFT, x + 660, y + 325, 110, 24, IDC_FPS_LIMIT_VALUE);
-    Label(state, 0, hwnd, L"The limiter uses AMD Frame Rate Target Control with verified read-back and restores the previous Radeon setting on exit.", x, y + 375, 780, 42);
+    Label(state, 0, hwnd, L"The limiter uses AMD Radeon Chill (minimum = maximum FPS), verifies read-back and restores its previous state on exit.", x, y + 375, 780, 42);
     Label(state, 0, hwnd, L"Brightness uses standard Windows WMI. Battery changes are verified by the Lenovo backend.", x, y + 425, 760, 30);
 
     Label(state, 1, hwnd, L"Button:", x, y, 65, 22);
@@ -1776,10 +1798,10 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
                                   x + 120, y + 86, 430, 40, IDC_OVERLAY_SCALE);
     SendMessageW(overlayScale, TBM_SETRANGE, TRUE, MAKELONG(50, 200)); SendMessageW(overlayScale, TBM_SETTICFREQ, 25, 0);
     PageField(state, 4, hwnd, L"STATIC", L"100%", SS_LEFT, x + 570, y + 94, 100, 24, IDC_OVERLAY_SCALE_VALUE);
-    Label(state, 4, hwnd, L"Opacity:", x, y + 140, 110, 24);
+    Label(state, 4, hwnd, L"Black opacity (text follows):", x, y + 140, 230, 24);
     HWND overlayOpacity = PageField(state, 4, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
-                                    x + 120, y + 132, 430, 40, IDC_OVERLAY_OPACITY);
-    SendMessageW(overlayOpacity, TBM_SETRANGE, TRUE, MAKELONG(30, 100)); SendMessageW(overlayOpacity, TBM_SETTICFREQ, 10, 0);
+                                    x + 235, y + 132, 315, 40, IDC_OVERLAY_OPACITY);
+    SendMessageW(overlayOpacity, TBM_SETRANGE, TRUE, MAKELONG(0, 100)); SendMessageW(overlayOpacity, TBM_SETTICFREQ, 10, 0);
     PageField(state, 4, hwnd, L"STATIC", L"85%", SS_LEFT, x + 570, y + 140, 100, 24, IDC_OVERLAY_OPACITY_VALUE);
     Label(state, 4, hwnd, L"Corner:", x, y + 188, 110, 24);
     HWND overlayCorner = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
@@ -1791,13 +1813,13 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 4, hwnd, L"Y margin:", x + 260, y + 236, 110, 24);
     HWND marginY = PageField(state, 4, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 370, y + 232, 70, 27, IDC_OVERLAY_MARGIN_Y, WS_EX_CLIENTEDGE);
     HWND marginYSpin = PageField(state, 4, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 442, y + 232, 22, 27, IDC_OVERLAY_MARGIN_Y_SPIN); ConfigureSpinner(marginYSpin, marginY, 0, 500);
-    Label(state, 4, hwnd, L"The overlay is topmost, click-through and does not inject code into games. FPS/frame-time use native real-time DXGI/D3D9 ETW events.", x, y + 300, 800, 48);
+    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS uses native DXGI/D3D9 ETW events and is hidden on the Windows desktop.", x, y + 300, 800, 48);
     Label(state, 4, hwnd, L"Some protected or exclusive-fullscreen games may hide a normal Windows overlay. Unavailable sensors are shown as N/A.", x, y + 360, 800, 40);
     PageField(state, 4, hwnd, L"STATIC", L"Updates once per second. Hotkey changes take effect after Apply.", SS_LEFT, x, y + 425, 800, 28, IDC_OVERLAY_STATUS);
 
     Label(state, 5, hwnd, APP_VERSION, x, y, 760, 30);
     Label(state, 5, hwnd,
-          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, custom fan curves, an AMD FRTC limiter, performance overlay, and automatically applies per-application TDP profiles while following launcher child processes.",
+          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, custom fan curves, an AMD Radeon Chill limiter, performance overlay, and automatically applies per-application TDP profiles while following launcher child processes.",
           x, y + 48, 790, 100);
     Label(state, 5, hwnd, L"Repository:", x, y + 175, 120, 24);
     PageField(state, 5, hwnd, L"BUTTON", L"Open GitHub repository", BS_PUSHBUTTON | WS_TABSTOP,
