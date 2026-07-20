@@ -548,6 +548,9 @@ private:
             DestroyOverlayWindow();
             return 0;
         case WM_DISPLAYCHANGE:
+            UpdateWindowLayout();
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
         case WM_DPICHANGED:
             UpdateWindowLayout();
             InvalidateRect(window, nullptr, FALSE);
@@ -699,11 +702,26 @@ private:
     double CalculateScale(const RECT& monitorRect, HMONITOR monitor, const Config& config) const {
         const int monitorWidth = (std::max)(1, static_cast<int>(monitorRect.right - monitorRect.left));
         const int monitorHeight = (std::max)(1, static_cast<int>(monitorRect.bottom - monitorRect.top));
+        int referenceWidth = monitorWidth;
+        int referenceHeight = monitorHeight;
+        MONITORINFOEXW monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (GetMonitorInfoW(monitor, &monitorInfo) != FALSE) {
+            DEVMODEW mode{};
+            mode.dmSize = sizeof(mode);
+            // Fullscreen games normally change the active mode temporarily;
+            // the registry mode remains the panel/native desktop resolution.
+            if (EnumDisplaySettingsW(monitorInfo.szDevice, ENUM_REGISTRY_SETTINGS, &mode) != FALSE) {
+                referenceWidth = (std::max)(referenceWidth, static_cast<int>(mode.dmPelsWidth));
+                referenceHeight = (std::max)(referenceHeight, static_cast<int>(mode.dmPelsHeight));
+            }
+        }
         const double dpiScale = static_cast<double>(DpiForMonitor(monitor)) / 96.0;
-        const double resolutionScale = std::sqrt((static_cast<double>(monitorWidth) / 1920.0) *
-                                                 (static_cast<double>(monitorHeight) / 1080.0));
+        const double resolutionScale = std::sqrt((static_cast<double>(referenceWidth) / 1920.0) *
+                                                 (static_cast<double>(referenceHeight) / 1080.0));
         const double effective = (static_cast<double>(config.scalePercent) / 100.0) * dpiScale *
-                                 (std::max)(0.70, (std::min)(2.0, resolutionScale));
+                                 (std::max)(1.0, (std::min)(2.0, resolutionScale));
+        if (config.layoutStyle == 1) return (std::max)(0.50, (std::min)(4.0, effective));
         const double monitorFit = (std::min)(static_cast<double>(monitorWidth) / 360.0,
                                              static_cast<double>(monitorHeight) / 318.0);
         return (std::max)(0.50, (std::min)((std::min)(4.0, monitorFit), effective));
@@ -748,10 +766,11 @@ private:
         int x = monitorLeft;
         int y = monitorTop;
         if (config.layoutStyle == 1) {
-            // The compact style is always a top bar. Horizontal margins are
-            // symmetric so the single strip spans the selected monitor.
             width = monitorWidth;
-            height = static_cast<int>(std::lround(28.0 * scale));
+            const bool lowResolution = width < 1600;
+            const double fitScale = lowResolution ? 1.60 : static_cast<double>(width) / 1120.0;
+            const double barTextScale = (std::min)(scale, (std::max)(0.75, fitScale));
+            height = static_cast<int>(std::lround(31.0 * barTextScale));
             height = (std::max)(1, (std::min)(monitorHeight, height));
             x = monitorLeft;
             y = monitorTop;
@@ -851,8 +870,13 @@ private:
         }
 
         const double scale = currentScale_;
+        RECT physicalWindow{};
+        GetWindowRect(window, &physicalWindow);
+        const int physicalWidth = (std::max)(1, static_cast<int>(physicalWindow.right - physicalWindow.left));
+        const bool lowResolutionMode = config.layoutStyle == 1 && physicalWidth < 1600;
+        const double topBarFitScale = lowResolutionMode ? 1.60 : static_cast<double>(width) / 1120.0;
         const double textScale = config.layoutStyle == 1 ?
-            (std::min)(scale, (std::max)(0.55, static_cast<double>(width) / 1120.0)) : scale;
+            (std::min)(scale, (std::max)(0.75, topBarFitScale)) : scale;
         const int fontHeight = (std::max)(8, static_cast<int>(std::lround(15.0 * textScale)));
         HFONT font = CreateFontW(-fontHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -888,16 +912,19 @@ private:
             const int requestedPadding = (std::max)(3, static_cast<int>(std::lround(8.0 * textScale)));
             const int padding = (std::min)(requestedPadding, (std::max)(0, (width - 1) / 2));
             const int gap = (std::max)(4, static_cast<int>(std::lround(10.0 * textScale)));
-            const int usableWidth = (std::max)(1, width - (2 * padding));
-            const int weights[7]{13, 20, 21, 15, 12, 10, 9};
+            const int layoutWidth = lowResolutionMode ? physicalWidth : width;
+            const int layoutHeight = lowResolutionMode ?
+                (std::max)(1, static_cast<int>(std::lround(static_cast<double>(height) * layoutWidth /
+                                                          static_cast<double>((std::max)(1, width))))) : height;
+            const int usableWidth = (std::max)(1, layoutWidth - (2 * padding));
             RECT segments[7]{};
-            int segmentLeft = padding;
-            int accumulatedWeight = 0;
+            const int weights[7]{13, 20, 21, 15, 12, 10, 9};
+            int segmentLeft = padding, accumulatedWeight = 0;
             for (int index = 0; index < 7; ++index) {
                 accumulatedWeight += weights[index];
-                const int segmentRight = index == 6 ? width - padding :
+                const int segmentRight = index == 6 ? layoutWidth - padding :
                     padding + ((usableWidth * accumulatedWeight) / 100);
-                segments[index] = RECT{segmentLeft, 0, segmentRight, height};
+                segments[index] = RECT{segmentLeft, 0, segmentRight, layoutHeight};
                 segmentLeft = segmentRight;
             }
 
@@ -933,33 +960,39 @@ private:
             fpsRect.left += fpsInset;
             fpsRect.right -= fpsInset;
             const int fpsLabelWidth = textWidth(L"FPS");
-            RECT fpsLabel{fpsRect.left, 0, (std::min)(fpsRect.right, fpsRect.left + fpsLabelWidth), height};
+            RECT fpsLabel{fpsRect.left, fpsRect.top, (std::min)(fpsRect.right, fpsRect.left + fpsLabelWidth), fpsRect.bottom};
             SetTextColor(targetDc, yellow);
             DrawTextW(targetDc, L"FPS", -1, &fpsLabel,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             const int fpsValueWidth = textWidth(fpsValue);
-            RECT fpsValueRect{(std::min)(fpsRect.right, fpsLabel.right + gap), 0,
-                              (std::min)(fpsRect.right, fpsLabel.right + gap + fpsValueWidth), height};
+            RECT fpsValueRect{(std::min)(fpsRect.right, fpsLabel.right + gap), fpsRect.top,
+                              (std::min)(fpsRect.right, fpsLabel.right + gap + fpsValueWidth), fpsRect.bottom};
             SetTextColor(targetDc, white);
             DrawTextW(targetDc, fpsValue.c_str(), -1, &fpsValueRect,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            RECT miniGraph{fpsValueRect.right + gap,
-                           (std::max)(2, static_cast<int>(std::lround(9.0 * textScale))),
-                           fpsRect.right,
-                           height - (std::max)(2, static_cast<int>(std::lround(9.0 * textScale)))};
-            PaintMiniGraph(targetDc, miniGraph, snapshot.frameHistory, textScale, yellow);
+            const int graphInset = (std::max)(2, static_cast<int>(std::lround((lowResolutionMode ? 3.0 : 9.0) * textScale)));
+            RECT miniGraph{fpsValueRect.right + gap, fpsRect.top + graphInset,
+                           fpsRect.right, fpsRect.bottom - graphInset};
+            if (!lowResolutionMode) PaintMiniGraph(targetDc, miniGraph, snapshot.frameHistory, textScale, yellow);
 
             const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + L"  " +
                 (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + L"  " +
                 FormatNumber(snapshot.powerWatts, L"%.1fW");
             const NumericMetric& vramTotal = snapshot.vramCapacityBytes.known ?
                 snapshot.vramCapacityBytes : snapshot.vramBudgetBytes;
+            const auto compactMemoryForWidth = [lowResolutionMode](const NumericMetric& used, const NumericMetric& total) {
+                if (!lowResolutionMode) return FormatCompactMemory(used, total);
+                if (!used.known || !total.known || used.value < 0.0 || total.value <= 0.0) return std::wstring(L"N/A");
+                wchar_t buffer[64]{};
+                return swprintf_s(buffer, L"%.1f/%.1fG", used.value / kBytesPerGiB,
+                                  total.value / kBytesPerGiB) >= 0 ? std::wstring(buffer) : std::wstring(L"N/A");
+            };
             const std::wstring gpuValue = FormatNumber(snapshot.gpuPercent, L"%.0f%%") + L"  " +
-                                          FormatCompactMemory(snapshot.vramUsedBytes, vramTotal);
+                                          compactMemoryForWidth(snapshot.vramUsedBytes, vramTotal);
             drawPair(segments[1], L"Z1E", orange, cpuValue);
             drawPair(segments[2], L"780M", green, gpuValue);
             drawPair(segments[3], L"RAM", cyan,
-                     FormatCompactMemory(snapshot.ramUsedBytes, snapshot.ramTotalBytes));
+                     compactMemoryForWidth(snapshot.ramUsedBytes, snapshot.ramTotalBytes));
             drawPair(segments[4], L"FAN", orange,
                      snapshot.firmwareKnown ? std::to_wstring(snapshot.fanRpm) + L"RPM" : L"N/A");
             drawPair(segments[5], L"BATT", green, battery);
@@ -1343,6 +1376,7 @@ private:
     }
 
     void WorkerMain() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         LegionGoPresentTrace::Collector presentTrace;
         PdhMetrics pdh;
         DxgiMetrics dxgi;
@@ -1354,6 +1388,9 @@ private:
         bool wasVisible = false;
         SteadyClock::time_point nextMetric = SteadyClock::now();
         SteadyClock::time_point nextPresentTraceStart = SteadyClock::now();
+        SteadyClock::time_point traceIntentSince = SteadyClock::now();
+        bool traceIntent = false;
+        bool stableTraceEnabled = false;
 
         HANDLE waitHandles[2]{stopEvent_, wakeEvent_};
         for (;;) {
@@ -1386,6 +1423,9 @@ private:
                 telemetryOpen = true;
                 nextMetric = SteadyClock::now();
                 nextPresentTraceStart = SteadyClock::now();
+                traceIntentSince = SteadyClock::now();
+                traceIntent = false;
+                stableTraceEnabled = false;
                 wasVisible = true;
             }
 
@@ -1397,14 +1437,48 @@ private:
             if (observedForegroundWindow != nullptr) {
                 GetWindowThreadProcessId(observedForegroundWindow, &observedForegroundProcess);
             }
-            foregroundState_.store((IsWindowsDesktopForeground(observedForegroundWindow) ? (1ULL << 32U) : 0ULL) |
+            const bool foregroundIsDesktop = IsWindowsDesktopForeground(observedForegroundWindow);
+            foregroundState_.store((foregroundIsDesktop ? (1ULL << 32U) : 0ULL) |
                                    static_cast<unsigned long long>(observedForegroundProcess));
             const SteadyClock::time_point now = SteadyClock::now();
-
-            if (!presentTrace.Running() && now >= nextPresentTraceStart) {
-                if (!presentTrace.Start()) nextPresentTraceStart = now + std::chrono::seconds(2);
+            bool fpsCaptureEnabled = true;
+            {
+                std::lock_guard<std::mutex> lock(configMutex_);
+                fpsCaptureEnabled = config_.fpsCaptureEnabled;
             }
-            for (const auto& frame : presentTrace.Drain()) AddFrame(frame.processId, frame.milliseconds, 0U);
+
+            // Configuration-off is immediate. Only shell/game foreground
+            // transitions are debounced to avoid ETW session churn.
+            if (!fpsCaptureEnabled) {
+                if (stableTraceEnabled || traceIntent || presentTrace.Running()) presentTrace.Stop();
+                stableTraceEnabled = false;
+                traceIntent = false;
+                frameSamplesByProcess_.clear();
+                selectedFrameProcessId_ = 0U;
+            } else {
+                const bool requestedTrace = !foregroundIsDesktop;
+                if (requestedTrace != traceIntent) {
+                    traceIntent = requestedTrace;
+                    traceIntentSince = now;
+                }
+                if (traceIntent != stableTraceEnabled &&
+                    now - traceIntentSince >= std::chrono::milliseconds(750)) {
+                    stableTraceEnabled = traceIntent;
+                    if (!stableTraceEnabled) {
+                        presentTrace.Stop();
+                        frameSamplesByProcess_.clear();
+                        selectedFrameProcessId_ = 0U;
+                    } else {
+                        nextPresentTraceStart = now;
+                    }
+                }
+            }
+            if (fpsCaptureEnabled && stableTraceEnabled) {
+                if (!presentTrace.Running() && now >= nextPresentTraceStart) {
+                    if (!presentTrace.Start()) nextPresentTraceStart = now + std::chrono::seconds(2);
+                }
+                for (const auto& frame : presentTrace.Drain()) AddFrame(frame.processId, frame.milliseconds, 0U);
+            }
 
             if (telemetryOpen && now >= nextMetric) {
                 Snapshot snapshot{};

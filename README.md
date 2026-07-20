@@ -103,14 +103,14 @@ Hardware observations on BIOS `N3CN37WW`: `28%` stabilized near `2100 RPM`; `84%
 
 ### Overlay
 
-The Overlay tab configures an autonomous RTSS-style display. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), black overlay opacity (`0-100%`, background and text fade together), screen corner and X/Y margins are configurable; DPI and monitor resolution are also considered automatically.
+The Overlay tab configures an autonomous RTSS-style display. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), black overlay opacity (`0-100%`, background and text fade together), screen corner and X/Y margins are configurable. Font size follows Windows DPI rather than the game's render resolution, so switching to 1280x800 fullscreen does not shrink it.
 
 Two layouts are available: the original vertical panel and a compact full-width top performance bar. The top bar follows the fixed colored labels `FPS`, `Z1E`, `780M`, `RAM`, `FAN`, `BATT`, followed by the 24-hour clock.
 
 Metrics update once per second and are rendered in this fixed order:
 
 1. FPS;
-2. rolling frame-pacing graph (numeric frame time is currently hidden);
+2. rolling frame-pacing graph (numeric frame time is hidden; the mini graph is omitted below 1600 pixels to preserve readable text);
 3. CPU usage;
 4. CPU temperature;
 5. CPU package power;
@@ -121,7 +121,7 @@ Metrics update once per second and are rendered in this fixed order:
 10. remaining battery percentage;
 11. local time in 24-hour format.
 
-FPS and frame pacing come directly from real-time `Microsoft-Windows-DXGI` and `Microsoft-Windows-D3D9` ETW `Present_Start` events. FPS is suppressed when the Windows desktop or taskbar is foreground, avoiding a misleading shell/display-refresh value. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
+FPS capture is disabled by default for zero graphics-tracing overhead. When **Capture FPS with filtered ETW** is enabled, FPS and frame pacing come directly from real-time `Microsoft-Windows-DXGI` and `Microsoft-Windows-D3D9` `Present_Start` events. Provider-side event-ID filters prevent unrelated analytic events from reaching the collector; its threads run below normal priority, and the ETW session is stopped on the Windows desktop. Disable this checkbox for a protected title that reacts badly to any external present tracing: all other overlay sensors remain available with FPS shown as `N/A`. FPS is also suppressed when the Windows desktop or taskbar is foreground, avoiding a misleading shell/display-refresh value. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
 
 Because the overlay deliberately avoids game injection, a protected game or true exclusive-fullscreen presentation may cover it. Borderless/windowed fullscreen is the most compatible mode.
 

@@ -134,6 +134,7 @@ constexpr int IDC_OVERLAY_MARGIN_Y = 5209;
 constexpr int IDC_OVERLAY_MARGIN_Y_SPIN = 5210;
 constexpr int IDC_OVERLAY_STATUS = 5211;
 constexpr int IDC_OVERLAY_STYLE = 5212;
+constexpr int IDC_OVERLAY_FPS_CAPTURE = 5213;
 constexpr int IDC_FPS_LIMIT_ENABLE = 5220;
 constexpr int IDC_FPS_LIMIT = 5221;
 constexpr int IDC_FPS_LIMIT_VALUE = 5222;
@@ -358,6 +359,7 @@ void CreateDefaultConfiguration() {
         IniWriteInt(L"Fan", (L"Duty" + std::to_wstring(index)).c_str(), fanDefaults[index]);
     IniWrite(L"FanProfiles", L"Order", L"");
     IniWriteInt(L"Overlay", L"VisibleAtStartup", 0);
+    IniWriteInt(L"Overlay", L"FpsCaptureEnabled", 0);
     IniWriteInt(L"Overlay", L"FunctionKey", 10);
     IniWriteInt(L"Overlay", L"ScalePercent", 100);
     IniWriteInt(L"Overlay", L"OpacityPercent", 85);
@@ -891,6 +893,7 @@ void LoadConfiguration() {
     fanCurve = selectedFan->curve;
     LegionGoOverlay::Config overlay;
     overlay.enabledAtStartup = IniInt(L"Overlay", L"VisibleAtStartup", 0) != 0;
+    overlay.fpsCaptureEnabled = IniInt(L"Overlay", L"FpsCaptureEnabled", 0) != 0;
     overlay.functionKey = (std::max)(1, (std::min)(24, IniInt(L"Overlay", L"FunctionKey", 10)));
     overlay.scalePercent = (std::max)(50, (std::min)(200, IniInt(L"Overlay", L"ScalePercent", 100)));
     overlay.opacityPercent = (std::max)(0, (std::min)(100, IniInt(L"Overlay", L"OpacityPercent", 85)));
@@ -1586,6 +1589,7 @@ void PopulateSettings(HWND hwnd) {
     SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_SETCHECK, state->fanEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     RefreshFanProfileCombo(hwnd);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_ENABLE, BM_SETCHECK, LegionGoOverlay::IsVisible() ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendDlgItemMessageW(hwnd, IDC_OVERLAY_FPS_CAPTURE, BM_SETCHECK, state->overlay.fpsCaptureEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_HOTKEY, CB_SETCURSEL, state->overlay.functionKey - 1, 0);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_SETPOS, TRUE, state->overlay.scalePercent);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_SETPOS, TRUE, state->overlay.opacityPercent);
@@ -1631,6 +1635,7 @@ bool ApplySettings(HWND hwnd) {
     const bool fanEnabled = SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
     LegionGoOverlay::Config overlay;
     overlay.enabledAtStartup = SendDlgItemMessageW(hwnd, IDC_OVERLAY_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    overlay.fpsCaptureEnabled = SendDlgItemMessageW(hwnd, IDC_OVERLAY_FPS_CAPTURE, BM_GETCHECK, 0, 0) == BST_CHECKED;
     overlay.functionKey = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_HOTKEY, CB_GETCURSEL, 0, 0)) + 1;
     overlay.scalePercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_GETPOS, 0, 0));
     overlay.opacityPercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_GETPOS, 0, 0));
@@ -1649,6 +1654,7 @@ bool ApplySettings(HWND hwnd) {
     const bool startup = SendDlgItemMessageW(hwnd, IDC_STARTUP, BM_GETCHECK, 0, 0) == BST_CHECKED;
     LegionGoOverlay::ApplyConfig(overlay);
     if (LegionGoOverlay::ActiveFunctionKey() != overlay.functionKey) {
+        LegionGoOverlay::ApplyConfig(state->overlay);
         Message(hwnd, L"Overlay", L"That function key is already in use. Choose another key.", MB_OK | MB_ICONERROR);
         ShowSettingsPage(hwnd, 4); return false;
     }
@@ -1666,6 +1672,7 @@ bool ApplySettings(HWND hwnd) {
     const std::wstring selectedFanProfileId = state->fanProfiles[static_cast<std::size_t>(state->selectedFanProfile)].id;
     WriteFanProfilesToIni(state->fanProfiles, selectedFanProfileId);
     IniWriteInt(L"Overlay", L"VisibleAtStartup", overlay.enabledAtStartup ? 1 : 0);
+    IniWriteInt(L"Overlay", L"FpsCaptureEnabled", overlay.fpsCaptureEnabled ? 1 : 0);
     IniWriteInt(L"Overlay", L"FunctionKey", overlay.functionKey);
     IniWriteInt(L"Overlay", L"ScalePercent", overlay.scalePercent);
     IniWriteInt(L"Overlay", L"OpacityPercent", overlay.opacityPercent);
@@ -1793,6 +1800,8 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     HWND overlayHotkey = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
                                    x + 120, y + 44, 130, 300, IDC_OVERLAY_HOTKEY);
     for (int key = 1; key <= 24; ++key) SendMessageW(overlayHotkey, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>((L"F" + std::to_wstring(key)).c_str()));
+    PageField(state, 4, hwnd, L"BUTTON", L"Capture FPS with filtered ETW", BS_AUTOCHECKBOX | WS_TABSTOP,
+              x + 330, y + 46, 330, 26, IDC_OVERLAY_FPS_CAPTURE);
     Label(state, 4, hwnd, L"Scale:", x, y + 94, 110, 24);
     HWND overlayScale = PageField(state, 4, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
                                   x + 120, y + 86, 430, 40, IDC_OVERLAY_SCALE);
@@ -1813,7 +1822,7 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 4, hwnd, L"Y margin:", x + 260, y + 236, 110, 24);
     HWND marginY = PageField(state, 4, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 370, y + 232, 70, 27, IDC_OVERLAY_MARGIN_Y, WS_EX_CLIENTEDGE);
     HWND marginYSpin = PageField(state, 4, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 442, y + 232, 22, 27, IDC_OVERLAY_MARGIN_Y_SPIN); ConfigureSpinner(marginYSpin, marginY, 0, 500);
-    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS uses native DXGI/D3D9 ETW events and is hidden on the Windows desktop.", x, y + 300, 800, 48);
+    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS capture uses event-filtered ETW only outside the Windows desktop.", x, y + 300, 800, 48);
     Label(state, 4, hwnd, L"Some protected or exclusive-fullscreen games may hide a normal Windows overlay. Unavailable sensors are shown as N/A.", x, y + 360, 800, 40);
     PageField(state, 4, hwnd, L"STATIC", L"Updates once per second. Hotkey changes take effect after Apply.", SS_LEFT, x, y + 425, 800, 28, IDC_OVERLAY_STATUS);
 

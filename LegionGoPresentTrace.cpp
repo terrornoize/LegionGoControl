@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -24,6 +25,28 @@ constexpr USHORT kDxgiPresentStart = 0x002a;
 constexpr USHORT kD3d9PresentStart = 0x0001;
 constexpr ULONGLONG kPresentKeyword = 0x8000000000000002ULL;
 
+struct SingleEventIdFilter {
+    BOOLEAN filterIn = TRUE;
+    UCHAR reserved = 0;
+    USHORT count = 1;
+    USHORT eventId = 0;
+};
+
+ULONG EnableOnlyEvent(TRACEHANDLE session, const GUID& provider, USHORT eventId) {
+    SingleEventIdFilter filter{};
+    filter.eventId = eventId;
+    EVENT_FILTER_DESCRIPTOR descriptor{};
+    descriptor.Ptr = reinterpret_cast<ULONGLONG>(&filter);
+    descriptor.Size = sizeof(filter);
+    descriptor.Type = EVENT_FILTER_TYPE_EVENT_ID;
+    ENABLE_TRACE_PARAMETERS parameters{};
+    parameters.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    parameters.EnableFilterDesc = &descriptor;
+    parameters.FilterDescCount = 1;
+    return EnableTraceEx2(session, &provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                          TRACE_LEVEL_VERBOSE, kPresentKeyword, 0, 0, &parameters);
+}
+
 std::vector<unsigned char> PropertiesBuffer() {
     std::vector<unsigned char> bytes(sizeof(EVENT_TRACE_PROPERTIES) + sizeof(kSessionName));
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(bytes.data());
@@ -41,6 +64,7 @@ std::vector<unsigned char> PropertiesBuffer() {
 struct Collector::Impl {
     TRACEHANDLE session = 0;
     TRACEHANDLE trace = INVALID_PROCESSTRACE_HANDLE;
+    EVENT_TRACE_LOGFILEW log{};
     std::thread thread;
     std::atomic_bool running{false};
     LARGE_INTEGER frequency{};
@@ -79,7 +103,11 @@ struct Collector::Impl {
     }
 };
 
-Collector::Collector() : impl_(new Impl) {}
+Collector::Collector() : impl_(new Impl) {
+    // Cleanup is unconditional so an orphaned session from a crashed process
+    // cannot remain enabled when FPS capture starts disabled on the next run.
+    impl_->StopStaleSession();
+}
 Collector::~Collector() { Stop(); delete impl_; impl_ = nullptr; }
 
 bool Collector::Start() {
@@ -92,25 +120,28 @@ bool Collector::Start() {
     ULONG status = StartTraceW(&impl_->session, kSessionName,
                                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(bytes.data()));
     if (status != ERROR_SUCCESS) { impl_->session = 0; return false; }
-    status = EnableTraceEx2(impl_->session, &kDxgiProvider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                            TRACE_LEVEL_VERBOSE, kPresentKeyword, 0, 0, nullptr);
-    if (status == ERROR_SUCCESS) {
-        status = EnableTraceEx2(impl_->session, &kD3d9Provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                TRACE_LEVEL_VERBOSE, kPresentKeyword, 0, 0, nullptr);
-    }
+    // Filter in the providers, not merely in our callback. Without this ETW
+    // would deliver every analytic DXGI/D3D9 event and could disturb games.
+    status = EnableOnlyEvent(impl_->session, kDxgiProvider, kDxgiPresentStart);
+    if (status == ERROR_SUCCESS) status = EnableOnlyEvent(impl_->session, kD3d9Provider, kD3d9PresentStart);
     if (status != ERROR_SUCCESS) { Stop(); return false; }
     QueryPerformanceFrequency(&impl_->frequency);
-    EVENT_TRACE_LOGFILEW log{};
-    log.LoggerName = const_cast<LPWSTR>(kSessionName);
-    log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME;
-    log.EventRecordCallback = &Impl::OnEvent;
-    log.Context = impl_;
-    impl_->trace = OpenTraceW(&log);
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->pending.reserve(4096U);
+    }
+    impl_->log = {};
+    impl_->log.LoggerName = const_cast<LPWSTR>(kSessionName);
+    impl_->log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME;
+    impl_->log.EventRecordCallback = &Impl::OnEvent;
+    impl_->log.Context = impl_;
+    impl_->trace = OpenTraceW(&impl_->log);
     if (impl_->trace == INVALID_PROCESSTRACE_HANDLE) { Stop(); return false; }
     impl_->running.store(true);
     const TRACEHANDLE openedTrace = impl_->trace;
     try {
         impl_->thread = std::thread([this, openedTrace] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             TRACEHANDLE handle = openedTrace;
             ProcessTrace(&handle, 1, nullptr, nullptr);
             impl_->running.store(false);
@@ -132,6 +163,7 @@ void Collector::Stop() {
         impl_->trace = INVALID_PROCESSTRACE_HANDLE;
     }
     if (impl_->thread.joinable()) impl_->thread.join();
+    impl_->log = {};
     impl_->running.store(false);
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->pending.clear(); impl_->lastQpc.clear();
@@ -143,7 +175,9 @@ std::vector<Frame> Collector::Drain() {
     std::vector<Frame> result;
     if (impl_ == nullptr) return result;
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    result.swap(impl_->pending);
+    result.assign(std::make_move_iterator(impl_->pending.begin()),
+                  std::make_move_iterator(impl_->pending.end()));
+    impl_->pending.clear(); // Retain callback-side capacity; allocations stay off the ETW path.
     return result;
 }
 
