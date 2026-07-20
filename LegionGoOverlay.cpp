@@ -1,4 +1,5 @@
 #include "LegionGoOverlay.h"
+#include "LegionGoPresentTrace.h"
 
 #include <dxgi1_4.h>
 #include <pdh.h>
@@ -12,11 +13,8 @@
 #include <cwchar>
 #include <deque>
 #include <iomanip>
-#include <limits>
-#include <locale>
 #include <map>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -82,393 +80,11 @@ Config SanitizeConfig(const Config& input) {
     result.scalePercent = (std::max)(50, (std::min)(200, result.scalePercent));
     result.opacityPercent = (std::max)(30, (std::min)(100, result.opacityPercent));
     result.corner = (std::max)(0, (std::min)(3, result.corner));
+    result.layoutStyle = (std::max)(0, (std::min)(1, result.layoutStyle));
     result.marginX = (std::max)(0, (std::min)(10000, result.marginX));
     result.marginY = (std::max)(0, (std::min)(10000, result.marginY));
     return result;
 }
-
-bool FileExists(const std::wstring& path) {
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U;
-}
-
-std::wstring JoinPath(const std::wstring& directory, const wchar_t* relativePath) {
-    if (directory.empty()) {
-        return std::wstring(relativePath);
-    }
-    const wchar_t last = directory.back();
-    if (last == L'\\' || last == L'/') {
-        return directory + relativePath;
-    }
-    return directory + L"\\" + relativePath;
-}
-
-std::string NormalizeHeader(const std::string& input) {
-    std::string result;
-    result.reserve(input.size());
-    for (unsigned char character : input) {
-        if ((character >= static_cast<unsigned char>('A') && character <= static_cast<unsigned char>('Z')) ||
-            (character >= static_cast<unsigned char>('a') && character <= static_cast<unsigned char>('z')) ||
-            (character >= static_cast<unsigned char>('0') && character <= static_cast<unsigned char>('9'))) {
-            if (character >= static_cast<unsigned char>('A') && character <= static_cast<unsigned char>('Z')) {
-                character = static_cast<unsigned char>(character - static_cast<unsigned char>('A') +
-                                                       static_cast<unsigned char>('a'));
-            }
-            result.push_back(static_cast<char>(character));
-        }
-    }
-    return result;
-}
-
-std::vector<std::string> ParseCsvRecord(const std::string& line) {
-    std::vector<std::string> fields;
-    std::string field;
-    bool quoted = false;
-    for (std::size_t index = 0; index < line.size(); ++index) {
-        const char character = line[index];
-        if (character == '"') {
-            if (quoted && index + 1U < line.size() && line[index + 1U] == '"') {
-                field.push_back('"');
-                ++index;
-            } else {
-                quoted = !quoted;
-            }
-        } else if (character == ',' && !quoted) {
-            fields.push_back(field);
-            field.clear();
-        } else {
-            field.push_back(character);
-        }
-    }
-    fields.push_back(field);
-    return fields;
-}
-
-bool ParseProcessId(const std::string& text, DWORD& processId) {
-    std::istringstream stream(text);
-    stream.imbue(std::locale::classic());
-    unsigned long long parsed = 0ULL;
-    stream >> std::ws >> parsed >> std::ws;
-    if (!stream.eof() || stream.fail() || parsed == 0ULL ||
-        parsed > static_cast<unsigned long long>((std::numeric_limits<DWORD>::max)())) {
-        return false;
-    }
-    processId = static_cast<DWORD>(parsed);
-    return true;
-}
-
-bool ParsePositiveDouble(const std::string& text, double& value) {
-    std::istringstream stream(text);
-    stream.imbue(std::locale::classic());
-    double parsed = 0.0;
-    stream >> std::ws >> parsed >> std::ws;
-    if (!stream.eof() || stream.fail() || !std::isfinite(parsed) || parsed <= 0.0 || parsed > 10000.0) {
-        return false;
-    }
-    value = parsed;
-    return true;
-}
-
-class PresentMonCapture {
-public:
-    PresentMonCapture() = default;
-    PresentMonCapture(const PresentMonCapture&) = delete;
-    PresentMonCapture& operator=(const PresentMonCapture&) = delete;
-
-    ~PresentMonCapture() {
-        Stop();
-    }
-
-    bool Start(const std::wstring& executable) {
-        Stop();
-
-        SECURITY_ATTRIBUTES security{};
-        security.nLength = sizeof(security);
-        security.bInheritHandle = TRUE;
-
-        HANDLE pipeRead = nullptr;
-        HANDLE pipeWrite = nullptr;
-        if (CreatePipe(&pipeRead, &pipeWrite, &security, 0U) == FALSE) {
-            return false;
-        }
-        if (SetHandleInformation(pipeRead, HANDLE_FLAG_INHERIT, 0U) == FALSE) {
-            CloseHandle(pipeRead);
-            CloseHandle(pipeWrite);
-            return false;
-        }
-
-        HANDLE nullHandle = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING,
-                                        FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (nullHandle == INVALID_HANDLE_VALUE) {
-            CloseHandle(pipeRead);
-            CloseHandle(pipeWrite);
-            return false;
-        }
-
-        HANDLE job = CreateJobObjectW(nullptr, nullptr);
-        if (job == nullptr) {
-            CloseHandle(nullHandle);
-            CloseHandle(pipeRead);
-            CloseHandle(pipeWrite);
-            return false;
-        }
-
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobLimits{};
-        jobLimits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jobLimits,
-                                    static_cast<DWORD>(sizeof(jobLimits))) == FALSE) {
-            CloseHandle(job);
-            CloseHandle(nullHandle);
-            CloseHandle(pipeRead);
-            CloseHandle(pipeWrite);
-            return false;
-        }
-
-        std::wstring commandLine = L"\"" + executable +
-            L"\" --output_stdout --no_console_stats --v1_metrics --session_name LegionGoControlOverlay --stop_existing_session";
-        std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
-        mutableCommand.push_back(L'\0');
-
-        STARTUPINFOEXW startup{};
-        startup.StartupInfo.cb = sizeof(startup);
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = nullHandle;
-        startup.StartupInfo.hStdOutput = pipeWrite;
-        startup.StartupInfo.hStdError = nullHandle;
-
-        SIZE_T attributeBytes = 0U;
-        static_cast<void>(InitializeProcThreadAttributeList(nullptr, 1U, 0U, &attributeBytes));
-        std::vector<unsigned char> attributeStorage(attributeBytes);
-        startup.lpAttributeList = attributeBytes == 0U ? nullptr :
-            reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeStorage.data());
-        HANDLE inheritedHandles[2]{pipeWrite, nullHandle};
-        const bool attributeListInitialized = startup.lpAttributeList != nullptr &&
-            InitializeProcThreadAttributeList(startup.lpAttributeList, 1U, 0U, &attributeBytes) != FALSE;
-        const bool attributesReady = attributeListInitialized &&
-            UpdateProcThreadAttribute(startup.lpAttributeList, 0U, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                      inheritedHandles, sizeof(inheritedHandles), nullptr, nullptr) != FALSE;
-        if (!attributesReady) {
-            if (attributeListInitialized) {
-                DeleteProcThreadAttributeList(startup.lpAttributeList);
-            }
-            CloseHandle(job);
-            CloseHandle(nullHandle);
-            CloseHandle(pipeRead);
-            CloseHandle(pipeWrite);
-            return false;
-        }
-
-        PROCESS_INFORMATION processInfo{};
-        const DWORD creationFlags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-        const BOOL created = CreateProcessW(executable.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE,
-                                            creationFlags, nullptr, nullptr, &startup.StartupInfo, &processInfo);
-        DeleteProcThreadAttributeList(startup.lpAttributeList);
-        CloseHandle(pipeWrite);
-        CloseHandle(nullHandle);
-        if (created == FALSE) {
-            CloseHandle(job);
-            CloseHandle(pipeRead);
-            return false;
-        }
-
-        if (AssignProcessToJobObject(job, processInfo.hProcess) == FALSE) {
-            TerminateProcess(processInfo.hProcess, 1U);
-            CloseHandle(processInfo.hThread);
-            CloseHandle(processInfo.hProcess);
-            CloseHandle(job);
-            CloseHandle(pipeRead);
-            return false;
-        }
-        if (ResumeThread(processInfo.hThread) == static_cast<DWORD>(-1)) {
-            TerminateProcess(processInfo.hProcess, 1U);
-            CloseHandle(processInfo.hThread);
-            CloseHandle(processInfo.hProcess);
-            CloseHandle(job);
-            CloseHandle(pipeRead);
-            return false;
-        }
-
-        CloseHandle(processInfo.hThread);
-        process_ = processInfo.hProcess;
-        job_ = job;
-        pipeRead_ = pipeRead;
-        executable_ = executable;
-        buffer_.clear();
-        processColumn_ = kMissingColumn;
-        frameTimeColumn_ = kMissingColumn;
-        droppedColumn_ = kMissingColumn;
-        return true;
-    }
-
-    void Stop() {
-        if (process_ != nullptr && WaitForSingleObject(process_, 0U) == WAIT_TIMEOUT && !executable_.empty())
-            RequestSessionTermination(executable_);
-        if (process_ != nullptr) {
-            WaitForSingleObject(process_, 750U);
-        }
-        // Job close is the final bounded fallback if the graceful named-session
-        // termination did not make the collector exit.
-        if (job_ != nullptr) {
-            CloseHandle(job_);
-            job_ = nullptr;
-        }
-        if (process_ != nullptr) {
-            WaitForSingleObject(process_, 250U);
-            CloseHandle(process_);
-            process_ = nullptr;
-        }
-        if (pipeRead_ != nullptr) {
-            CloseHandle(pipeRead_);
-            pipeRead_ = nullptr;
-        }
-        executable_.clear();
-        buffer_.clear();
-        processColumn_ = kMissingColumn;
-        frameTimeColumn_ = kMissingColumn;
-        droppedColumn_ = kMissingColumn;
-    }
-
-    bool IsRunning() const {
-        return process_ != nullptr && WaitForSingleObject(process_, 0U) == WAIT_TIMEOUT;
-    }
-
-    template <typename Callback>
-    bool Drain(Callback&& callback) {
-        if (pipeRead_ == nullptr) {
-            return false;
-        }
-
-        // Never let a busy all-process trace monopolize the worker. This keeps
-        // stop-event handling and firmware restore bounded during shutdown.
-        constexpr std::size_t kMaximumBytesPerDrain = 256U * 1024U;
-        std::size_t totalBytesRead = 0U;
-        bool readAnything = false;
-        while (totalBytesRead < kMaximumBytesPerDrain) {
-            DWORD available = 0U;
-            if (PeekNamedPipe(pipeRead_, nullptr, 0U, nullptr, &available, nullptr) == FALSE) {
-                break;
-            }
-            if (available == 0U) {
-                break;
-            }
-
-            char chunk[16384]{};
-            const DWORD requested = (std::min)(available, static_cast<DWORD>(sizeof(chunk)));
-            DWORD bytesRead = 0U;
-            if (ReadFile(pipeRead_, chunk, requested, &bytesRead, nullptr) == FALSE || bytesRead == 0U) {
-                break;
-            }
-            buffer_.append(chunk, static_cast<std::size_t>(bytesRead));
-            totalBytesRead += static_cast<std::size_t>(bytesRead);
-            readAnything = true;
-            ConsumeRecords(callback);
-            if (buffer_.size() > 1024U * 1024U) {
-                buffer_.clear();
-                processColumn_ = kMissingColumn;
-                frameTimeColumn_ = kMissingColumn;
-                droppedColumn_ = kMissingColumn;
-            }
-        }
-        return readAnything;
-    }
-
-private:
-    static void RequestSessionTermination(const std::wstring& executable) {
-        std::wstring command = L"\"" + executable +
-            L"\" --terminate_existing_session --session_name LegionGoControlOverlay";
-        std::vector<wchar_t> mutableCommand(command.begin(), command.end()); mutableCommand.push_back(L'\0');
-        STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION process{};
-        if (CreateProcessW(executable.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-                           nullptr, nullptr, &startup, &process) != FALSE) {
-            CloseHandle(process.hThread); WaitForSingleObject(process.hProcess, 750U); CloseHandle(process.hProcess);
-        }
-    }
-
-    template <typename Callback>
-    void ConsumeRecords(Callback& callback) {
-        std::size_t recordStart = 0U;
-        bool quoted = false;
-        for (std::size_t index = 0U; index < buffer_.size(); ++index) {
-            const char character = buffer_[index];
-            if (character == '"') {
-                if (quoted && index + 1U < buffer_.size() && buffer_[index + 1U] == '"') {
-                    ++index;
-                } else {
-                    quoted = !quoted;
-                }
-            } else if ((character == '\r' || character == '\n') && !quoted) {
-                std::string record = buffer_.substr(recordStart, index - recordStart);
-                if (index + 1U < buffer_.size() && character == '\r' && buffer_[index + 1U] == '\n') {
-                    ++index;
-                }
-                recordStart = index + 1U;
-                ProcessRecord(record, callback);
-            }
-        }
-        if (recordStart != 0U) {
-            buffer_.erase(0U, recordStart);
-        }
-    }
-
-    template <typename Callback>
-    void ProcessRecord(std::string& record, Callback& callback) {
-        if (record.empty()) {
-            return;
-        }
-        if (record.size() >= 3U && static_cast<unsigned char>(record[0]) == 0xEFU &&
-            static_cast<unsigned char>(record[1]) == 0xBBU && static_cast<unsigned char>(record[2]) == 0xBFU) {
-            record.erase(0U, 3U);
-        }
-
-        const std::vector<std::string> fields = ParseCsvRecord(record);
-        std::size_t processHeader = kMissingColumn;
-        std::size_t frameHeader = kMissingColumn;
-        std::size_t droppedHeader = kMissingColumn;
-        for (std::size_t index = 0U; index < fields.size(); ++index) {
-            const std::string normalized = NormalizeHeader(fields[index]);
-            if (normalized == "processid") {
-                processHeader = index;
-            } else if (normalized == "msbetweenpresents") {
-                frameHeader = index;
-            } else if (normalized == "dropped") {
-                droppedHeader = index;
-            }
-        }
-        if (processHeader != kMissingColumn && frameHeader != kMissingColumn) {
-            processColumn_ = processHeader;
-            frameTimeColumn_ = frameHeader;
-            droppedColumn_ = droppedHeader;
-            return;
-        }
-        if (processColumn_ == kMissingColumn || frameTimeColumn_ == kMissingColumn ||
-            processColumn_ >= fields.size() || frameTimeColumn_ >= fields.size()) {
-            return;
-        }
-
-        if (droppedColumn_ < fields.size()) {
-            const std::string dropped = NormalizeHeader(fields[droppedColumn_]);
-            if (dropped == "1" || dropped == "true" || dropped == "yes") return;
-        }
-        DWORD processId = 0U;
-        double frameTime = 0.0;
-        if (ParseProcessId(fields[processColumn_], processId) &&
-            ParsePositiveDouble(fields[frameTimeColumn_], frameTime)) {
-            callback(processId, frameTime);
-        }
-    }
-
-    static constexpr std::size_t kMissingColumn = (std::numeric_limits<std::size_t>::max)();
-    HANDLE process_ = nullptr;
-    HANDLE job_ = nullptr;
-    HANDLE pipeRead_ = nullptr;
-    std::wstring executable_;
-    std::string buffer_;
-    std::size_t processColumn_ = kMissingColumn;
-    std::size_t frameTimeColumn_ = kMissingColumn;
-    std::size_t droppedColumn_ = kMissingColumn;
-};
 
 class PdhMetrics {
 public:
@@ -1110,23 +726,37 @@ private:
         const int monitorBottom = static_cast<int>(information.rcMonitor.bottom);
         const int monitorWidth = monitorRight - monitorLeft;
         const int monitorHeight = monitorBottom - monitorTop;
-        int width = static_cast<int>(std::lround(360.0 * scale));
-        int height = static_cast<int>(std::lround(318.0 * scale));
-        width = (std::max)(1, (std::min)(monitorWidth, width));
-        height = (std::max)(1, (std::min)(monitorHeight, height));
-        const int marginX = static_cast<int>(std::lround(static_cast<double>(config.marginX) * scale));
-        const int marginY = static_cast<int>(std::lround(static_cast<double>(config.marginY) * scale));
+        const int requestedMarginX = static_cast<int>(std::lround(static_cast<double>(config.marginX) * scale));
+        const int requestedMarginY = static_cast<int>(std::lround(static_cast<double>(config.marginY) * scale));
+        int width = 0;
+        int height = 0;
+        int x = monitorLeft;
+        int y = monitorTop;
+        if (config.layoutStyle == 1) {
+            // The compact style is always a top bar. Horizontal margins are
+            // symmetric so the single strip spans the selected monitor.
+            width = monitorWidth;
+            height = static_cast<int>(std::lround(28.0 * scale));
+            height = (std::max)(1, (std::min)(monitorHeight, height));
+            x = monitorLeft;
+            y = monitorTop;
+        } else {
+            width = static_cast<int>(std::lround(360.0 * scale));
+            height = static_cast<int>(std::lround(318.0 * scale));
+            width = (std::max)(1, (std::min)(monitorWidth, width));
+            height = (std::max)(1, (std::min)(monitorHeight, height));
 
-        int x = monitorLeft + marginX;
-        int y = monitorTop + marginY;
-        if (config.corner == 1 || config.corner == 3) {
-            x = monitorRight - width - marginX;
+            x = monitorLeft + requestedMarginX;
+            y = monitorTop + requestedMarginY;
+            if (config.corner == 1 || config.corner == 3) {
+                x = monitorRight - width - requestedMarginX;
+            }
+            if (config.corner == 2 || config.corner == 3) {
+                y = monitorBottom - height - requestedMarginY;
+            }
+            x = (std::max)(monitorLeft, (std::min)(monitorRight - width, x));
+            y = (std::max)(monitorTop, (std::min)(monitorBottom - height, y));
         }
-        if (config.corner == 2 || config.corner == 3) {
-            y = monitorBottom - height - marginY;
-        }
-        x = (std::max)(monitorLeft, (std::min)(monitorRight - width, x));
-        y = (std::max)(monitorTop, (std::min)(monitorBottom - height, y));
 
         SetWindowPos(window_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
     }
@@ -1148,6 +778,18 @@ private:
         }
         wchar_t buffer[64]{};
         if (swprintf_s(buffer, L"%.1f / %.1f GB", used.value / kBytesPerGiB,
+                       total.value / kBytesPerGiB) < 0) {
+            return L"N/A";
+        }
+        return std::wstring(buffer);
+    }
+
+    static std::wstring FormatCompactMemory(const NumericMetric& used, const NumericMetric& total) {
+        if (!used.known || !total.known || used.value < 0.0 || total.value <= 0.0) {
+            return L"N/A";
+        }
+        wchar_t buffer[64]{};
+        if (swprintf_s(buffer, L"%.1f/%.1fGB", used.value / kBytesPerGiB,
                        total.value / kBytesPerGiB) < 0) {
             return L"N/A";
         }
@@ -1187,9 +829,16 @@ private:
             std::lock_guard<std::mutex> lock(snapshotMutex_);
             snapshot = snapshot_;
         }
+        Config config{};
+        {
+            std::lock_guard<std::mutex> lock(configMutex_);
+            config = config_;
+        }
 
         const double scale = currentScale_;
-        const int fontHeight = (std::max)(8, static_cast<int>(std::lround(15.0 * scale)));
+        const double textScale = config.layoutStyle == 1 ?
+            (std::min)(scale, (std::max)(0.55, static_cast<double>(width) / 1120.0)) : scale;
+        const int fontHeight = (std::max)(8, static_cast<int>(std::lround(15.0 * textScale)));
         HFONT font = CreateFontW(-fontHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
@@ -1215,42 +864,135 @@ private:
             }
         }
 
-        // Keep this order synchronized with the documented RTSS-style layout.
-        const std::vector<std::pair<std::wstring, std::wstring>> rows{
-            {L"FPS", FormatNumber(snapshot.fps, L"%.1f")},
-            {L"FRAME TIME", FormatNumber(snapshot.frameTimeMs, L"%.1f ms")},
-            {L"CPU USAGE", FormatNumber(snapshot.cpuPercent, L"%.0f%%")},
-            {L"CPU TEMP", temperature},
-            {L"CPU POWER", FormatNumber(snapshot.powerWatts, L"%.1f W")},
-            {L"GPU USAGE", FormatNumber(snapshot.gpuPercent, L"%.0f%%")},
-            {L"VRAM", FormatMemory(snapshot.vramUsedBytes,
-                                    snapshot.vramCapacityBytes.known ? snapshot.vramCapacityBytes :
-                                                                       snapshot.vramBudgetBytes)},
-            {L"RAM FREE", FormatMemory(snapshot.ramUsedBytes, snapshot.ramTotalBytes)},
-            {L"FAN", fan},
-            {L"BATTERY", battery},
-            {L"TIME", time}
-        };
+        if (config.layoutStyle == 1) {
+            const COLORREF yellow = RGB(255, 214, 64);
+            const COLORREF orange = RGB(255, 145, 55);
+            const COLORREF green = RGB(91, 220, 112);
+            const COLORREF cyan = RGB(62, 215, 255);
+            const COLORREF white = RGB(242, 246, 250);
+            const int requestedPadding = (std::max)(3, static_cast<int>(std::lround(8.0 * textScale)));
+            const int padding = (std::min)(requestedPadding, (std::max)(0, (width - 1) / 2));
+            const int gap = (std::max)(2, static_cast<int>(std::lround(5.0 * textScale)));
+            const int usableWidth = (std::max)(1, width - (2 * padding));
+            const int weights[7]{21, 18, 19, 14, 12, 8, 8};
+            RECT segments[7]{};
+            int segmentLeft = padding;
+            int accumulatedWeight = 0;
+            for (int index = 0; index < 7; ++index) {
+                accumulatedWeight += weights[index];
+                const int segmentRight = index == 6 ? width - padding :
+                    padding + ((usableWidth * accumulatedWeight) / 100);
+                segments[index] = RECT{segmentLeft, 0, segmentRight, height};
+                segmentLeft = segmentRight;
+            }
 
-        const int padding = (std::max)(4, static_cast<int>(std::lround(12.0 * scale)));
-        const int rowHeight = (std::max)(11, static_cast<int>(std::lround(22.0 * scale)));
-        const int graphHeight = (std::max)(20, static_cast<int>(std::lround(48.0 * scale)));
-        const int valueLeft = static_cast<int>(std::lround(130.0 * scale));
-        int y = padding;
-        for (std::size_t index = 0U; index < rows.size(); ++index) {
-            RECT labelRect{padding, y, (std::min)(valueLeft, width - padding), y + rowHeight};
-            RECT valueRect{valueLeft, y, width - padding, y + rowHeight};
-            SetTextColor(targetDc, RGB(145, 158, 171));
-            DrawTextW(targetDc, rows[index].first.c_str(), -1, &labelRect,
+            const auto textWidth = [targetDc](const std::wstring& textValue) {
+                SIZE size{};
+                return GetTextExtentPoint32W(targetDc, textValue.c_str(),
+                    static_cast<int>(textValue.size()), &size) != FALSE ? size.cx : 0;
+            };
+            const auto drawPair = [targetDc, gap, &textWidth, white](RECT rect, const wchar_t* label,
+                                                                    COLORREF color,
+                                                                    const std::wstring& value) {
+                const int segmentWidth = static_cast<int>(rect.right - rect.left);
+                const int inset = (std::min)(gap, (std::max)(0, segmentWidth / 2));
+                rect.left += inset;
+                rect.right -= inset;
+                const int labelWidth = textWidth(label);
+                RECT labelRect{rect.left, rect.top, (std::min)(rect.right, rect.left + labelWidth), rect.bottom};
+                SetTextColor(targetDc, color);
+                DrawTextW(targetDc, label, -1, &labelRect,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                RECT valueRect{(std::min)(rect.right, labelRect.right + gap), rect.top, rect.right, rect.bottom};
+                SetTextColor(targetDc, white);
+                DrawTextW(targetDc, value.c_str(), -1, &valueRect,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            };
+
+            const std::wstring fpsValue = FormatNumber(snapshot.fps, L"%.0f") + L" " +
+                                          FormatNumber(snapshot.frameTimeMs, L"%.1fms");
+            RECT fpsRect = segments[0];
+            const int fpsWidth = static_cast<int>(fpsRect.right - fpsRect.left);
+            const int fpsInset = (std::min)(gap, (std::max)(0, fpsWidth / 2));
+            fpsRect.left += fpsInset;
+            fpsRect.right -= fpsInset;
+            const int fpsLabelWidth = textWidth(L"FPS");
+            RECT fpsLabel{fpsRect.left, 0, (std::min)(fpsRect.right, fpsRect.left + fpsLabelWidth), height};
+            SetTextColor(targetDc, yellow);
+            DrawTextW(targetDc, L"FPS", -1, &fpsLabel,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            SetTextColor(targetDc, RGB(238, 243, 248));
-            DrawTextW(targetDc, rows[index].second.c_str(), -1, &valueRect,
+            const int fpsValueWidth = textWidth(fpsValue);
+            RECT fpsValueRect{(std::min)(fpsRect.right, fpsLabel.right + gap), 0,
+                              (std::min)(fpsRect.right, fpsLabel.right + gap + fpsValueWidth), height};
+            SetTextColor(targetDc, white);
+            DrawTextW(targetDc, fpsValue.c_str(), -1, &fpsValueRect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            RECT miniGraph{fpsValueRect.right + gap,
+                           (std::max)(2, static_cast<int>(std::lround(9.0 * textScale))),
+                           fpsRect.right,
+                           height - (std::max)(2, static_cast<int>(std::lround(9.0 * textScale)))};
+            PaintMiniGraph(targetDc, miniGraph, snapshot.frameHistory, textScale, yellow);
+
+            const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + L" " +
+                (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + L" " +
+                FormatNumber(snapshot.powerWatts, L"%.1fW");
+            const NumericMetric& vramTotal = snapshot.vramCapacityBytes.known ?
+                snapshot.vramCapacityBytes : snapshot.vramBudgetBytes;
+            const std::wstring gpuValue = FormatNumber(snapshot.gpuPercent, L"%.0f%%") + L" " +
+                                          FormatCompactMemory(snapshot.vramUsedBytes, vramTotal);
+            drawPair(segments[1], L"Z1E", orange, cpuValue);
+            drawPair(segments[2], L"780M", green, gpuValue);
+            drawPair(segments[3], L"RAM", cyan,
+                     FormatCompactMemory(snapshot.ramUsedBytes, snapshot.ramTotalBytes));
+            drawPair(segments[4], L"FAN", orange,
+                     snapshot.firmwareKnown ? std::to_wstring(snapshot.fanRpm) + L"RPM" : L"N/A");
+            drawPair(segments[5], L"BATT", green, battery);
+            RECT timeRect = segments[6];
+            const int timeWidth = static_cast<int>(timeRect.right - timeRect.left);
+            const int timeInset = (std::min)(gap, (std::max)(0, timeWidth / 2));
+            timeRect.left += timeInset;
+            timeRect.right -= timeInset;
+            SetTextColor(targetDc, cyan);
+            DrawTextW(targetDc, time.c_str(), -1, &timeRect,
                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            y += rowHeight;
-            if (index == 1U) {
-                RECT graphRect{padding, y, width - padding, (std::min)(height - padding, y + graphHeight)};
-                PaintGraph(targetDc, graphRect, snapshot.frameHistory, scale);
-                y += graphHeight;
+        } else {
+            // Keep this order synchronized with the documented RTSS-style layout.
+            const std::vector<std::pair<std::wstring, std::wstring>> rows{
+                {L"FPS", FormatNumber(snapshot.fps, L"%.1f")},
+                {L"FRAME TIME", FormatNumber(snapshot.frameTimeMs, L"%.1f ms")},
+                {L"CPU USAGE", FormatNumber(snapshot.cpuPercent, L"%.0f%%")},
+                {L"CPU TEMP", temperature},
+                {L"CPU POWER", FormatNumber(snapshot.powerWatts, L"%.1f W")},
+                {L"GPU USAGE", FormatNumber(snapshot.gpuPercent, L"%.0f%%")},
+                {L"VRAM", FormatMemory(snapshot.vramUsedBytes,
+                                        snapshot.vramCapacityBytes.known ? snapshot.vramCapacityBytes :
+                                                                           snapshot.vramBudgetBytes)},
+                {L"RAM USED", FormatMemory(snapshot.ramUsedBytes, snapshot.ramTotalBytes)},
+                {L"FAN", fan},
+                {L"BATTERY", battery},
+                {L"TIME", time}
+            };
+
+            const int padding = (std::max)(4, static_cast<int>(std::lround(12.0 * scale)));
+            const int rowHeight = (std::max)(11, static_cast<int>(std::lround(22.0 * scale)));
+            const int graphHeight = (std::max)(20, static_cast<int>(std::lround(48.0 * scale)));
+            const int valueLeft = static_cast<int>(std::lround(130.0 * scale));
+            int y = padding;
+            for (std::size_t index = 0U; index < rows.size(); ++index) {
+                RECT labelRect{padding, y, (std::min)(valueLeft, width - padding), y + rowHeight};
+                RECT valueRect{valueLeft, y, width - padding, y + rowHeight};
+                SetTextColor(targetDc, RGB(145, 158, 171));
+                DrawTextW(targetDc, rows[index].first.c_str(), -1, &labelRect,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SetTextColor(targetDc, RGB(238, 243, 248));
+                DrawTextW(targetDc, rows[index].second.c_str(), -1, &valueRect,
+                          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                y += rowHeight;
+                if (index == 1U) {
+                    RECT graphRect{padding, y, width - padding, (std::min)(height - padding, y + graphHeight)};
+                    PaintGraph(targetDc, graphRect, snapshot.frameHistory, scale);
+                    y += graphHeight;
+                }
             }
         }
 
@@ -1269,6 +1011,45 @@ private:
             DeleteDC(bufferDc);
         }
         EndPaint(window, &paint);
+    }
+
+    static void PaintMiniGraph(HDC dc, const RECT& rect, const std::vector<double>& history,
+                               double scale, COLORREF color) {
+        const int graphWidth = rect.right - rect.left;
+        const int graphHeight = rect.bottom - rect.top;
+        if (graphWidth <= 2 || graphHeight <= 2 || history.empty()) {
+            return;
+        }
+
+        double maximum = 50.0;
+        for (double value : history) {
+            if (std::isfinite(value)) {
+                maximum = (std::max)(maximum, (std::min)(100.0, value));
+            }
+        }
+        const int penWidth = (std::max)(1, static_cast<int>(std::lround(scale)));
+        HPEN pen = CreatePen(PS_SOLID, penWidth, color);
+        if (pen == nullptr) {
+            return;
+        }
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        const std::size_t count = history.size();
+        for (std::size_t index = 0U; index < count; ++index) {
+            const int x = count <= 1U ? rect.right - 1 :
+                rect.left + static_cast<int>((static_cast<unsigned long long>(index) *
+                static_cast<unsigned long long>(graphWidth - 1)) /
+                static_cast<unsigned long long>(count - 1U));
+            const double normalized = (std::max)(0.0, (std::min)(maximum, history[index])) / maximum;
+            const int y = rect.bottom - 1 -
+                static_cast<int>(std::lround(normalized * static_cast<double>(graphHeight - 2)));
+            if (index == 0U) {
+                MoveToEx(dc, x, y, nullptr);
+            } else {
+                LineTo(dc, x, y);
+            }
+        }
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
     }
 
     static void PaintGraph(HDC dc, const RECT& rect, const std::vector<double>& history, double scale) {
@@ -1379,8 +1160,7 @@ private:
             memory.ullAvailPhys <= memory.ullTotalPhys) {
             snapshot.ramTotalBytes.value = static_cast<double>(memory.ullTotalPhys);
             snapshot.ramTotalBytes.known = true;
-            // The requested overlay reports free / total physical RAM.
-            snapshot.ramUsedBytes.value = static_cast<double>(memory.ullAvailPhys);
+            snapshot.ramUsedBytes.value = static_cast<double>(memory.ullTotalPhys - memory.ullAvailPhys);
             snapshot.ramUsedBytes.known = true;
         }
     }
@@ -1395,13 +1175,104 @@ private:
     }
 
     void UpdateFrameMetrics(Snapshot& snapshot, SteadyClock::time_point now) {
-        while (!frameSamples_.empty() && now - frameSamples_.front().received > std::chrono::seconds(5)) {
-            frameSamples_.pop_front();
+        const SteadyClock::time_point historyStart = now - std::chrono::seconds(5);
+        for (auto process = frameSamplesByProcess_.begin(); process != frameSamplesByProcess_.end();) {
+            std::deque<FrameSample>& samples = process->second;
+            while (!samples.empty() && samples.front().received < historyStart) {
+                samples.pop_front();
+            }
+            if (samples.empty()) {
+                process = frameSamplesByProcess_.erase(process);
+            } else {
+                ++process;
+            }
         }
-        const SteadyClock::time_point rollingStart = now - std::chrono::milliseconds(1000);
+
+        // Retain an overlap across one-second publications so a short ETW
+        // scheduling gap does not make otherwise continuous presents blink.
+        const SteadyClock::time_point rollingStart = now - std::chrono::milliseconds(2500);
+        const DWORD foregroundProcess = foregroundProcessId_.load();
+        DWORD targetProcess = 0U;
+        const auto foregroundSamples = frameSamplesByProcess_.find(foregroundProcess);
+        if (foregroundSamples != frameSamplesByProcess_.end()) {
+            std::size_t count = 0U;
+            for (const FrameSample& sample : foregroundSamples->second) {
+                if (sample.received >= rollingStart) {
+                    ++count;
+                }
+            }
+            if (count >= 2U) {
+                targetProcess = foregroundProcess;
+            }
+        }
+
+        // If the foreground PID is not presenting (launchers and games often
+        // use different PIDs), select the busiest stream that is still active.
+        std::size_t bestCount = 0U;
+        std::size_t bestContinuousCount = 0U;
+        bool bestActive = false;
+        SteadyClock::time_point bestLast{};
+        if (targetProcess == 0U) {
+            for (const auto& process : frameSamplesByProcess_) {
+                std::size_t count = 0U;
+                std::size_t continuousCount = 0U;
+                SteadyClock::time_point previous{};
+                SteadyClock::time_point last{};
+                for (const FrameSample& sample : process.second) {
+                    if (sample.received < rollingStart) {
+                        continue;
+                    }
+                    ++count;
+                    if (continuousCount == 0U || sample.received - previous <= std::chrono::milliseconds(250)) {
+                        ++continuousCount;
+                    } else {
+                        continuousCount = 1U;
+                    }
+                    previous = sample.received;
+                    last = sample.received;
+                }
+                if (count < 2U) {
+                    continue;
+                }
+                const bool active = last >= now - std::chrono::milliseconds(350);
+                const bool equallyDominant = active == bestActive &&
+                    continuousCount == bestContinuousCount && count == bestCount;
+                const bool preferCurrent = equallyDominant && process.first == selectedFrameProcessId_ &&
+                                           targetProcess != selectedFrameProcessId_;
+                const bool better = targetProcess == 0U || (active && !bestActive) ||
+                    (active == bestActive && (continuousCount > bestContinuousCount ||
+                    (continuousCount == bestContinuousCount && (count > bestCount ||
+                    (count == bestCount && (preferCurrent ||
+                    (targetProcess != selectedFrameProcessId_ && last > bestLast)))))));
+                if (better) {
+                    targetProcess = process.first;
+                    bestCount = count;
+                    bestContinuousCount = continuousCount;
+                    bestActive = active;
+                    bestLast = last;
+                }
+            }
+        }
+
+        if (targetProcess != selectedFrameProcessId_) {
+            selectedFrameProcessId_ = targetProcess;
+            // Never carry a previous target's five-second graph into a newly
+            // selected stream. Keep only the new target's current rolling data.
+            const auto selected = frameSamplesByProcess_.find(selectedFrameProcessId_);
+            if (selected != frameSamplesByProcess_.end()) {
+                while (!selected->second.empty() && selected->second.front().received < rollingStart) {
+                    selected->second.pop_front();
+                }
+            }
+        }
+
+        const auto selected = frameSamplesByProcess_.find(selectedFrameProcessId_);
+        if (selected == frameSamplesByProcess_.end()) {
+            return;
+        }
         double sum = 0.0;
         std::size_t rollingCount = 0U;
-        for (const FrameSample& sample : frameSamples_) {
+        for (const FrameSample& sample : selected->second) {
             snapshot.frameHistory.push_back(sample.milliseconds);
             if (sample.received >= rollingStart) {
                 sum += sample.milliseconds;
@@ -1416,17 +1287,18 @@ private:
         }
     }
 
-    void AddFrame(DWORD processId, double frameTime, DWORD foregroundProcessId) {
-        if (processId == 0U || processId != foregroundProcessId) {
+    void AddFrame(DWORD processId, double frameTime, DWORD presentMonProcessId) {
+        if (processId == 0U || processId == GetCurrentProcessId() || processId == presentMonProcessId) {
             return;
         }
         const SteadyClock::time_point now = SteadyClock::now();
-        frameSamples_.push_back(FrameSample{frameTime, now});
-        while (!frameSamples_.empty() && now - frameSamples_.front().received > std::chrono::seconds(5)) {
-            frameSamples_.pop_front();
+        std::deque<FrameSample>& samples = frameSamplesByProcess_[processId];
+        samples.push_back(FrameSample{frameTime, now});
+        while (!samples.empty() && samples.front().received < now - std::chrono::seconds(5)) {
+            samples.pop_front();
         }
-        while (frameSamples_.size() > 360U) {
-            frameSamples_.pop_front();
+        while (samples.size() > 360U) {
+            samples.pop_front();
         }
     }
 
@@ -1449,17 +1321,8 @@ private:
         }
     }
 
-    std::wstring PresentMonPath() const {
-        const std::wstring direct = JoinPath(baseDirectory_, L"PresentMon.exe");
-        if (FileExists(direct)) {
-            return direct;
-        }
-        const std::wstring fallback = JoinPath(baseDirectory_, L"third_party\\PresentMon\\PresentMon.exe");
-        return FileExists(fallback) ? fallback : std::wstring();
-    }
-
     void WorkerMain() {
-        PresentMonCapture presentMon;
+        LegionGoPresentTrace::Collector presentTrace;
         PdhMetrics pdh;
         DxgiMetrics dxgi;
         ULARGE_INTEGER previousIdle{};
@@ -1468,9 +1331,8 @@ private:
         bool havePreviousCpu = false;
         bool telemetryOpen = false;
         bool wasVisible = false;
-        DWORD foregroundProcess = 0U;
         SteadyClock::time_point nextMetric = SteadyClock::now();
-        SteadyClock::time_point nextPresentMonStart = SteadyClock::now();
+        SteadyClock::time_point nextPresentTraceStart = SteadyClock::now();
 
         HANDLE waitHandles[2]{stopEvent_, wakeEvent_};
         for (;;) {
@@ -1480,13 +1342,13 @@ private:
             const bool visible = visible_.load();
             if (!visible) {
                 if (wasVisible) {
-                    presentMon.Stop();
+                    presentTrace.Stop();
                     pdh.Close();
                     dxgi.Close();
                     telemetryOpen = false;
                     havePreviousCpu = false;
-                    foregroundProcess = 0U;
-                    frameSamples_.clear();
+                    frameSamplesByProcess_.clear();
+                    selectedFrameProcessId_ = 0U;
                     PublishSnapshot(Snapshot{});
                 }
                 wasVisible = false;
@@ -1502,34 +1364,25 @@ private:
                 dxgi.Open();
                 telemetryOpen = true;
                 nextMetric = SteadyClock::now();
-                nextPresentMonStart = SteadyClock::now();
+                nextPresentTraceStart = SteadyClock::now();
                 wasVisible = true;
             }
 
+            // Refresh this on the worker as well as during monitor layout so a
+            // target switch is visible to FPS selection without an extra
+            // one-second publication/layout cycle.
+            DWORD observedForegroundProcess = 0U;
+            const HWND observedForegroundWindow = GetForegroundWindow();
+            if (observedForegroundWindow != nullptr) {
+                GetWindowThreadProcessId(observedForegroundWindow, &observedForegroundProcess);
+            }
+            foregroundProcessId_.store(observedForegroundProcess);
             const SteadyClock::time_point now = SteadyClock::now();
-            const DWORD newForegroundProcess = foregroundProcessId_.load();
-            if (newForegroundProcess != foregroundProcess) {
-                foregroundProcess = newForegroundProcess;
-                frameSamples_.clear();
-            }
 
-            if (!presentMon.IsRunning()) {
-                presentMon.Stop();
-                frameSamples_.clear();
-                if (now >= nextPresentMonStart) {
-                    const std::wstring path = PresentMonPath();
-                    if (!path.empty() && presentMon.Start(path)) {
-                        nextPresentMonStart = now + std::chrono::seconds(2);
-                    } else {
-                        nextPresentMonStart = now + std::chrono::seconds(2);
-                    }
-                }
+            if (!presentTrace.Running() && now >= nextPresentTraceStart) {
+                if (!presentTrace.Start()) nextPresentTraceStart = now + std::chrono::seconds(2);
             }
-            if (presentMon.IsRunning()) {
-                presentMon.Drain([this, foregroundProcess](DWORD processId, double frameTime) {
-                    AddFrame(processId, frameTime, foregroundProcess);
-                });
-            }
+            for (const auto& frame : presentTrace.Drain()) AddFrame(frame.processId, frame.milliseconds, 0U);
 
             if (telemetryOpen && now >= nextMetric) {
                 Snapshot snapshot{};
@@ -1549,9 +1402,10 @@ private:
             }
         }
 
-        presentMon.Stop();
+        presentTrace.Stop();
         pdh.Close();
-        frameSamples_.clear();
+        frameSamplesByProcess_.clear();
+        selectedFrameProcessId_ = 0U;
     }
 
     mutable std::mutex lifecycleMutex_;
@@ -1577,7 +1431,8 @@ private:
     int firmwareTemperatureC_ = 0;
     int firmwareRpm_ = 0;
     bool firmwareKnown_ = false;
-    std::deque<FrameSample> frameSamples_;
+    std::map<DWORD, std::deque<FrameSample>> frameSamplesByProcess_;
+    DWORD selectedFrameProcessId_ = 0U;
 };
 
 } // namespace

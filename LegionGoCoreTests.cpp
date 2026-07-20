@@ -167,6 +167,15 @@ void TestProfileValidation() {
         Profile(L"UNC", L"\\\\server\\share\\game.exe"),
         Profile(L"Extended", L"\\\\?\\C:\\Games\\extended.exe")
     }).empty());
+    GameProfile fpsProfile = Profile(L"Limited", L"C:\\Games\\limited.exe");
+    fpsProfile.fpsLimitEnabled = true; fpsProfile.fpsLimit = 30;
+    CHECK(ValidateGameProfiles({fpsProfile}).empty());
+    fpsProfile.fpsLimit = 144;
+    CHECK(ValidateGameProfiles({fpsProfile}).empty());
+    fpsProfile.fpsLimit = 29;
+    CHECK(HasIssue(ValidateGameProfiles({fpsProfile}), ProfileValidationError::InvalidFpsLimit, 0));
+    fpsProfile.fpsLimit = 145;
+    CHECK(HasIssue(ValidateGameProfiles({fpsProfile}), ProfileValidationError::InvalidFpsLimit, 0));
 }
 
 void TestArbiter() {

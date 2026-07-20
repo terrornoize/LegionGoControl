@@ -377,6 +377,10 @@ std::vector<ProfileValidationIssue> ValidateGameProfiles(
             issues.push_back({ProfileValidationError::InvalidTdp, index, kNoProfile,
                               L"Invalid profile TDP: " + tdpError});
         }
+        if (profile.fpsLimitEnabled && (profile.fpsLimit < 30 || profile.fpsLimit > 144)) {
+            issues.push_back({ProfileValidationError::InvalidFpsLimit, index, kNoProfile,
+                              L"Profile FPS limit must be between 30 and 144."});
+        }
     }
     return issues;
 }

@@ -9,19 +9,10 @@ if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%" || exit /b 1
 
 set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DNDEBUG /DUNICODE /D_UNICODE"
 
-if not exist "%CD%\PresentMon.exe" (
-    echo ERROR: Bundled PresentMon.exe is missing.
-    exit /b 1
-)
-if not exist "%CD%\PresentMon-LICENSE.txt" (
-    echo ERROR: PresentMon license is missing.
-    exit /b 1
-)
-
 echo [1/3] Building LegionGoControl.exe (x64 Release)...
 rc /nologo /fo "%BUILD_DIR%\LegionGoControl.res" "%CD%\LegionGoControl.rc"
 if errorlevel 1 exit /b 1
-cl %CXXFLAGS% LegionGoControl.cpp LegionGoCore.cpp LegionGoOverlay.cpp "%BUILD_DIR%\LegionGoControl.res" /Fo"%BUILD_DIR%\\" /Fe"%CD%\LegionGoControl.exe" /link /MACHINE:X64 /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:"%CD%\app.manifest"
+cl %CXXFLAGS% LegionGoControl.cpp LegionGoCore.cpp LegionGoOverlay.cpp LegionGoPresentTrace.cpp LegionGoFrameLimiter.cpp "%BUILD_DIR%\LegionGoControl.res" /Fo"%BUILD_DIR%\\" /Fe"%CD%\LegionGoControl.exe" /link /MACHINE:X64 /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:"%CD%\app.manifest"
 if errorlevel 1 exit /b 1
 
 echo [2/3] Building LegionGoNativeWmiProbe.exe (x64 Release)...

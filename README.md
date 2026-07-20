@@ -12,10 +12,8 @@ LegionGoControl.exe
 ├─ Legion Go Raw Input mapper
 ├─ process monitor and Game Profiles resolver
 ├─ click-through performance overlay and native metric collectors
-└─ serialized calls to the backend
-
-PresentMon.exe
-└─ bundled MIT-licensed ETW collector for FPS and frame timing
+├─ verified AMD FRTC frame limiter with crash recovery
+└─ serialized calls to the Lenovo backend
 
 LegionGoNativeWmiProbe.exe
 ├─ Lenovo WMI access through ROOT\WMI / LENOVO_OTHER_METHOD / LENOVO_FAN_METHOD
@@ -24,7 +22,7 @@ LegionGoNativeWmiProbe.exe
 └─ verified battery-limit status/set/toggle
 ```
 
-All three executables must remain in the same directory. PresentMon attribution and license are under `third_party/PresentMon`.
+Both executables must remain in the same directory. FPS/frame timing is collected directly by LegionGoControl through Windows ETW; no RTSS or separate collector is required.
 
 ## Tray menu
 
@@ -105,7 +103,9 @@ Hardware observations on BIOS `N3CN37WW`: `28%` stabilized near `2100 RPM`; `84%
 
 ### Overlay
 
-The Overlay tab configures an autonomous RTSS-style panel. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), opacity (`30-100%`), screen corner and X/Y margins are configurable; DPI and monitor resolution are also considered automatically.
+The Overlay tab configures an autonomous RTSS-style display. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), opacity (`30-100%`), screen corner and X/Y margins are configurable; DPI and monitor resolution are also considered automatically.
+
+Two layouts are available: the original vertical panel and a compact full-width top performance bar. The top bar follows the fixed colored labels `FPS`, `Z1E`, `780M`, `RAM`, `FAN`, `BATT`, followed by the 24-hour clock.
 
 Metrics update once per second and are rendered in this fixed order:
 
@@ -116,14 +116,20 @@ Metrics update once per second and are rendered in this fixed order:
 5. CPU package power;
 6. GPU usage;
 7. VRAM used / configured total;
-8. free RAM / total RAM;
+8. occupied RAM / total RAM;
 9. fan RPM;
 10. remaining battery percentage;
 11. local time in 24-hour format.
 
-FPS and frame timing come from the bundled open-source PresentMon 2.5.1 ETW collector. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
+FPS and frame timing come directly from real-time `Microsoft-Windows-DXGI` and `Microsoft-Windows-D3D9` ETW `Present_Start` events. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
 
 Because the overlay deliberately avoids game injection, a protected game or true exclusive-fullscreen presentation may cover it. Borderless/windowed fullscreen is the most compatible mode.
+
+### FPS limiter
+
+Settings > General provides a base FPS limiter from `30` to `144 FPS`. Each Game Profile can optionally override that base target with its own `30-144 FPS` slider. The limiter uses the AMD driver-provided Frame Rate Target Control (FRTC) interface in `amdadlx64.dll`; it does not use RTSS, process suspension or game injection.
+
+Before the first change LegionGoControl stores the previous Radeon FRTC enabled state and FPS value. Every change is read back through the driver. The original Radeon state is restored on clean exit, and a persistent backup enables recovery after a crash or forced termination. On the tested Radeon 780M driver FRTC reports support with a native `15-1000 FPS` range; LegionGoControl intentionally exposes only `30-144 FPS`.
 
 ## Game Profiles
 
@@ -186,6 +192,8 @@ Path=C:\Games\EA FC 26\FC26.exe
 StapmW=16
 FastW=16
 SlowW=16
+FpsLimitEnabled=1
+FpsLimit=60
 ```
 
 Fan preferences use:
@@ -214,6 +222,11 @@ OpacityPercent=85
 Corner=1
 MarginX=20
 MarginY=20
+Style=1
+
+[General]
+FpsLimitEnabled=0
+FpsLimit=60
 ```
 
 Unknown INI keys and sections are not intentionally rewritten or deleted.
@@ -267,8 +280,7 @@ LegionGoNativeWmiProbe_state.txt
 LegionGoBatteryLimitState.txt
 LegionGoFanState.txt
 LegionGoFanBackup.txt
-PresentMon.exe
-PresentMon-LICENSE.txt
+LegionGoFpsBackup.ini
 ```
 
 For V2.1 beta testing, use a directory writable only by the intended administrator account. The frontend currently still runs elevated, so controller `launch` actions inherit elevated privileges.
@@ -292,7 +304,6 @@ Outputs:
 ```text
 LegionGoControl.exe
 LegionGoNativeWmiProbe.exe
-PresentMon.exe
 build\LegionGoCoreTests.exe
 ```
 
@@ -317,7 +328,7 @@ The tests never invoke WMI, change TDP, toggle battery state or launch the tray 
 
 ## Install / startup
 
-Place all three executables in a protected directory, for example:
+Place both executables in a protected directory, for example:
 
 ```text
 C:\NoInstall\LegionGoControl
@@ -342,7 +353,9 @@ Before daily use, validate on the actual device:
 9. Backend timeout/failure is shown as an error and does not claim success.
 10. Fan profiles survive restart and selecting each profile restores its ten saved points.
 11. The overlay hotkey toggles without focusing it; values refresh once per second and clicks pass through to the game.
-12. Compare FPS/frame time with PresentMon output and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
+12. Compare FPS/frame time with another trusted counter and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
+13. Enable a harmless 60 FPS base limit, verify AMD FRTC read-back, disable it, and confirm the previous Radeon state is restored.
+14. Configure a different Game Profile FPS target and verify base/profile switching and final restore.
 
 ## Safety
 

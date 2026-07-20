@@ -19,6 +19,7 @@
 #include <oleauto.h>
 
 #include "LegionGoCore.h"
+#include "LegionGoFrameLimiter.h"
 #include "LegionGoOverlay.h"
 #include "resource.h"
 
@@ -132,6 +133,13 @@ constexpr int IDC_OVERLAY_MARGIN_X_SPIN = 5208;
 constexpr int IDC_OVERLAY_MARGIN_Y = 5209;
 constexpr int IDC_OVERLAY_MARGIN_Y_SPIN = 5210;
 constexpr int IDC_OVERLAY_STATUS = 5211;
+constexpr int IDC_OVERLAY_STYLE = 5212;
+constexpr int IDC_FPS_LIMIT_ENABLE = 5220;
+constexpr int IDC_FPS_LIMIT = 5221;
+constexpr int IDC_FPS_LIMIT_VALUE = 5222;
+constexpr int IDC_PE_FPS_ENABLE = 5223;
+constexpr int IDC_PE_FPS_LIMIT = 5224;
+constexpr int IDC_PE_FPS_VALUE = 5225;
 constexpr int IDC_PROFILE_LIST = 5100;
 constexpr int IDC_PROFILE_ADD = 5101;
 constexpr int IDC_PROFILE_EDIT = 5102;
@@ -170,6 +178,7 @@ std::wstring g_backendPath;
 std::wstring g_tdpStatePath;
 std::wstring g_batteryStatePath;
 std::wstring g_fanStatePath;
+std::wstring g_fpsBackupPath;
 
 std::atomic_bool g_logging{false};
 int g_debounceMs = 40;
@@ -178,6 +187,9 @@ LegionGoCore::TdpTriple g_baseTdp{16, 20, 20};
 bool g_fanEnabled = false;
 LegionGoCore::FanCurve g_fanCurve{{44,48,48,51,51,55,60,71,87,87}};
 LegionGoOverlay::Config g_overlayConfig{};
+bool g_baseFpsLimitEnabled = false;
+int g_baseFpsLimit = 60;
+bool g_fpsLimiterReady = true;
 
 std::wstring Trim(const std::wstring& value) {
     std::size_t first = 0;
@@ -223,6 +235,7 @@ void InitializePaths() {
     g_tdpStatePath = g_baseDir + L"\\LegionGoNativeWmiProbe_state.txt";
     g_batteryStatePath = g_baseDir + L"\\LegionGoBatteryLimitState.txt";
     g_fanStatePath = g_baseDir + L"\\LegionGoFanState.txt";
+    g_fpsBackupPath = g_baseDir + L"\\LegionGoFpsBackup.ini";
 }
 
 std::wstring NowText() {
@@ -257,11 +270,63 @@ void IniWriteInt(const wchar_t* section, const wchar_t* key, int value) {
     IniWrite(section, key, std::to_wstring(value));
 }
 
+bool FpsBackupActive() {
+    return GetPrivateProfileIntW(L"Backup", L"Active", 0, g_fpsBackupPath.c_str()) != 0;
+}
+bool WriteFpsBackup(bool active, bool enabled, int fps) {
+    const auto write = [&](const wchar_t* key, const std::wstring& value) {
+        return WritePrivateProfileStringW(L"Backup", key, value.c_str(), g_fpsBackupPath.c_str()) != FALSE;
+    };
+    if (!write(L"Enabled", enabled ? L"1" : L"0") || !write(L"FPS", std::to_wstring(fps)) ||
+        !write(L"Active", active ? L"1" : L"0")) return false;
+    // Flush is best-effort: the profile API may return FALSE when no cached
+    // mapping exists even though all three writes above succeeded.
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_fpsBackupPath.c_str());
+    return true;
+}
+bool EnsureFpsBackup(std::wstring& error) {
+    if (FpsBackupActive()) return true;
+    const LegionGoFrameLimiter::State current = LegionGoFrameLimiter::Query();
+    if (!current.available || !current.supported) { error = current.error; return false; }
+    if (!WriteFpsBackup(true, current.enabled, current.fps)) { error = L"FPS backup could not be written"; return false; }
+    return true;
+}
+bool ApplyFpsTarget(bool enabled, int fps, std::wstring& error) {
+    if (!g_fpsLimiterReady) { error = L"FPS limiter disabled because crash recovery failed"; return false; }
+    if (!EnsureFpsBackup(error)) return false;
+    LegionGoFrameLimiter::State verified;
+    if (!LegionGoFrameLimiter::Set(enabled, fps, verified)) { error = verified.error; return false; }
+    error.clear(); return true;
+}
+bool RestoreFpsBackup(std::wstring& error) {
+    if (!FpsBackupActive()) { error.clear(); return true; }
+    wchar_t enabledText[16]{}, fpsText[32]{};
+    GetPrivateProfileStringW(L"Backup", L"Enabled", L"", enabledText, _countof(enabledText), g_fpsBackupPath.c_str());
+    GetPrivateProfileStringW(L"Backup", L"FPS", L"", fpsText, _countof(fpsText), g_fpsBackupPath.c_str());
+    wchar_t* fpsEnd = nullptr;
+    const long parsedFps = wcstol(fpsText, &fpsEnd, 10);
+    if ((wcscmp(enabledText, L"0") != 0 && wcscmp(enabledText, L"1") != 0) ||
+        fpsEnd == fpsText || *fpsEnd != L'\0' || parsedFps < 1 || parsedFps > 1000) {
+        error = L"FPS backup is incomplete or invalid; Radeon state was not changed";
+        return false;
+    }
+    const bool enabled = wcscmp(enabledText, L"1") == 0;
+    const int fps = static_cast<int>(parsedFps);
+    LegionGoFrameLimiter::State verified;
+    bool restored = LegionGoFrameLimiter::Set(enabled, fps, verified);
+    if (!restored) restored = LegionGoFrameLimiter::Set(enabled, fps, verified);
+    if (!restored) { error = verified.error; return false; }
+    if (!WriteFpsBackup(false, enabled, fps)) { error = L"FPS restore verified but backup marker cleanup failed"; return false; }
+    error.clear(); return true;
+}
+
 void CreateDefaultConfiguration() {
     if (FileExists(g_iniPath)) return;
     IniWriteInt(L"General", L"logging", 0);
     IniWriteInt(L"General", L"debounce_ms", 40);
     IniWriteInt(L"General", L"action_cooldown_ms", 250);
+    IniWriteInt(L"General", L"FpsLimitEnabled", 0);
+    IniWriteInt(L"General", L"FpsLimit", 60);
     IniWriteInt(L"TDP", L"BaseStapmW", 16);
     IniWriteInt(L"TDP", L"BaseFastW", 20);
     IniWriteInt(L"TDP", L"BaseSlowW", 20);
@@ -277,6 +342,7 @@ void CreateDefaultConfiguration() {
     IniWriteInt(L"Overlay", L"Corner", 1);
     IniWriteInt(L"Overlay", L"MarginX", 20);
     IniWriteInt(L"Overlay", L"MarginY", 20);
+    IniWriteInt(L"Overlay", L"Style", 0);
 
     struct DefaultButton { const wchar_t* name; int enabled; const wchar_t* action; const wchar_t* valueKey; const wchar_t* value; };
     const DefaultButton defaults[] = {
@@ -706,6 +772,8 @@ StoredProfile ReadProfile(const std::wstring& id) {
     result.value.tdp.fast = IniInt(section.c_str(), L"FastW", 20);
     result.value.tdp.slow = IniInt(section.c_str(), L"SlowW", 20);
     result.value.tdp = LegionGoCore::NormalizeTdpHierarchy(result.value.tdp);
+    result.value.fpsLimitEnabled = IniInt(section.c_str(), L"FpsLimitEnabled", 0) != 0;
+    result.value.fpsLimit = (std::max)(30, (std::min)(144, IniInt(section.c_str(), L"FpsLimit", 60)));
     return result;
 }
 std::vector<StoredProfile> LoadProfilesFromIni() {
@@ -728,6 +796,8 @@ void WriteProfilesToIni(const std::vector<StoredProfile>& profiles) {
         IniWriteInt(section.c_str(), L"StapmW", item.value.tdp.stapm);
         IniWriteInt(section.c_str(), L"FastW", item.value.tdp.fast);
         IniWriteInt(section.c_str(), L"SlowW", item.value.tdp.slow);
+        IniWriteInt(section.c_str(), L"FpsLimitEnabled", item.value.fpsLimitEnabled ? 1 : 0);
+        IniWriteInt(section.c_str(), L"FpsLimit", item.value.fpsLimit);
     }
     IniWrite(L"GameProfiles", L"Order", order);
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
@@ -774,6 +844,8 @@ void LoadConfiguration() {
     g_debounceMs = (std::max)(0, (std::min)(1000, IniInt(L"General", L"debounce_ms", 40)));
     g_actionCooldownMs = (std::max)(50, (std::min)(5000, IniInt(L"General", L"action_cooldown_ms",
                                                                     IniInt(L"General", L"ActionCooldownMs", 250))));
+    const bool baseFpsLimitEnabled = IniInt(L"General", L"FpsLimitEnabled", 0) != 0;
+    const int baseFpsLimit = (std::max)(30, (std::min)(144, IniInt(L"General", L"FpsLimit", 60)));
     LegionGoCore::TdpTriple base{
         IniInt(L"TDP", L"BaseStapmW", IniInt(L"General", L"BaseStapmW", IniInt(L"TDP", L"CustomStapmW", 16))),
         IniInt(L"TDP", L"BaseFastW", IniInt(L"General", L"BaseFastW", IniInt(L"TDP", L"CustomFastW", 20))),
@@ -803,6 +875,7 @@ void LoadConfiguration() {
     overlay.corner = (std::max)(0, (std::min)(3, IniInt(L"Overlay", L"Corner", 1)));
     overlay.marginX = (std::max)(0, (std::min)(500, IniInt(L"Overlay", L"MarginX", 20)));
     overlay.marginY = (std::max)(0, (std::min)(500, IniInt(L"Overlay", L"MarginY", 20)));
+    overlay.layoutStyle = (std::max)(0, (std::min)(1, IniInt(L"Overlay", L"Style", 0)));
     if (g_buttons.empty()) InitializeButtons();
     for (auto& button : g_buttons) {
         const bool pressed = button.pressed;
@@ -821,6 +894,8 @@ void LoadConfiguration() {
     g_fanProfiles = std::move(fanProfiles);
     g_selectedFanProfileId = std::move(selectedFanProfileId);
     g_overlayConfig = overlay;
+    g_baseFpsLimitEnabled = baseFpsLimitEnabled;
+    g_baseFpsLimit = baseFpsLimit;
     g_profiles = profiles;
 }
 
@@ -924,6 +999,11 @@ struct RuntimeStatus {
     FanStatus fan;
     unsigned fanOperationSequence = 0;
     bool fanOperationOk = true;
+    bool fpsLimitEnabled = false;
+    int fpsLimit = 60;
+    bool fpsLimitKnown = false;
+    bool fpsLimitOk = true;
+    std::wstring fpsLimitError;
 };
 std::mutex g_workerMutex;
 std::condition_variable g_workerCondition;
@@ -969,6 +1049,9 @@ void WorkerMain() {
     std::vector<std::wstring> activeProfilePaths;
     LegionGoCore::ProcessFamilyTracker familyTracker;
     unsigned consecutiveSnapshotFailures = 0;
+    bool fpsTargetAttempted = false, fpsOwned = false;
+    std::wstring attemptedFpsIdentity;
+    ULONGLONG lastFpsAttemptTick = 0;
     RuntimeStatus status;
     for (;;) {
         std::deque<WorkerJob> jobs;
@@ -1027,8 +1110,10 @@ void WorkerMain() {
         }
         if (stopRequested) break;
         LegionGoCore::TdpTriple base;
+        bool baseFpsEnabled = false; int baseFps = 60;
         std::vector<StoredProfile> stored;
-        { std::lock_guard<std::mutex> lock(g_configurationMutex); base = g_baseTdp; stored = g_profiles; }
+        { std::lock_guard<std::mutex> lock(g_configurationMutex);
+          base = g_baseTdp; stored = g_profiles; baseFpsEnabled = g_baseFpsLimitEnabled; baseFps = g_baseFpsLimit; }
         auto profiles = CoreProfiles(stored);
         if (!LegionGoCore::ValidateGameProfiles(profiles).empty()) {
             // A malformed or ambiguous profile file must never reach firmware.
@@ -1073,6 +1158,31 @@ void WorkerMain() {
             lastAttemptTick = now;
             Log(status.applyOk ? L"Applied TDP " + identity : status.error + L" for " + identity);
         }
+        bool desiredFpsEnabled = baseFpsEnabled; int desiredFps = baseFps;
+        if (selected < profiles.size() && profiles[selected].fpsLimitEnabled) {
+            desiredFpsEnabled = true; desiredFps = profiles[selected].fpsLimit;
+        }
+        status.fpsLimitEnabled = desiredFpsEnabled; status.fpsLimit = desiredFps;
+        const std::wstring fpsIdentity = std::wstring(desiredFpsEnabled ? L"1:" : L"0:") + std::to_wstring(desiredFps);
+        const bool retryFps = fpsTargetAttempted && !status.fpsLimitOk && now - lastFpsAttemptTick >= 10000;
+        const bool fpsBackupActive = FpsBackupActive();
+        if ((desiredFpsEnabled || fpsOwned || fpsBackupActive) && (!fpsTargetAttempted || fpsIdentity != attemptedFpsIdentity || retryFps)) {
+            std::wstring fpsError;
+            status.fpsLimitKnown = true;
+            if (desiredFpsEnabled) {
+                status.fpsLimitOk = ApplyFpsTarget(true, desiredFps, fpsError);
+                if (status.fpsLimitOk) fpsOwned = true;
+            } else {
+                // Relinquishing the limiter restores the exact Radeon state
+                // captured before LegionGoControl took ownership.
+                status.fpsLimitOk = RestoreFpsBackup(fpsError);
+                if (status.fpsLimitOk) fpsOwned = false;
+            }
+            status.fpsLimitError = fpsError;
+            fpsTargetAttempted = true; attemptedFpsIdentity = fpsIdentity; lastFpsAttemptTick = now;
+            if (status.fpsLimitOk) Log(desiredFpsEnabled ? L"Applied FPS target " + fpsIdentity : L"Restored original Radeon FPS state");
+            else LogAlways(L"FPS limiter failed: " + fpsError);
+        }
         PublishRuntime(status);
     }
     // Restore fan state first and always: a crash-recovery backup can remain
@@ -1080,6 +1190,8 @@ void WorkerMain() {
     DWORD code = 0;
     if (!BackendFanCommand(L"fan-restore", code))
         LogAlways(L"Fan curve restore failed during shutdown; code=" + std::to_wstring(code));
+    std::wstring fpsRestoreError;
+    if (!RestoreFpsBackup(fpsRestoreError)) LogAlways(L"FPS limiter restore failed during shutdown: " + fpsRestoreError);
     // Always make the configured base the final clean-shutdown TDP target.
     LegionGoCore::TdpTriple base;
     { std::lock_guard<std::mutex> lock(g_configurationMutex); base = g_baseTdp; }
@@ -1174,7 +1286,8 @@ struct SettingsState {
     bool normalizingFan = false;
     bool brightnessDragging = false;
     bool fanEnabled = false;
-    int debounce = 40, cooldown = 250;
+    bool baseFpsEnabled = false;
+    int debounce = 40, cooldown = 250, baseFps = 60;
     int selectedFanProfile = 0;
     LegionGoCore::TdpTriple base;
     LegionGoCore::FanCurve fanDraft{{44,48,48,51,51,55,60,71,87,87}};
@@ -1428,6 +1541,7 @@ void PopulateSettings(HWND hwnd) {
     state->debounce = g_debounceMs; state->cooldown = g_actionCooldownMs;
     { std::lock_guard<std::mutex> lock(g_configurationMutex);
       state->base = g_baseTdp; state->fanDraft = g_fanCurve; state->fanEnabled = g_fanEnabled;
+      state->baseFpsEnabled = g_baseFpsLimitEnabled; state->baseFps = g_baseFpsLimit;
       state->fanProfiles = g_fanProfiles; state->overlay = g_overlayConfig;
       state->selectedFanProfile = 0;
       for (std::size_t index = 0; index < state->fanProfiles.size(); ++index)
@@ -1438,6 +1552,9 @@ void PopulateSettings(HWND hwnd) {
     SendDlgItemMessageW(hwnd, IDC_STARTUP, BM_SETCHECK, state->startup ? BST_CHECKED : BST_UNCHECKED, 0);
     SetNumericValue(hwnd, IDC_DEBOUNCE, IDC_DEBOUNCE_SPIN, state->debounce);
     SetNumericValue(hwnd, IDC_COOLDOWN, IDC_COOLDOWN_SPIN, state->cooldown);
+    SendDlgItemMessageW(hwnd, IDC_FPS_LIMIT_ENABLE, BM_SETCHECK, state->baseFpsEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendDlgItemMessageW(hwnd, IDC_FPS_LIMIT, TBM_SETPOS, TRUE, state->baseFps);
+    SetText(hwnd, IDC_FPS_LIMIT_VALUE, std::to_wstring(state->baseFps) + L" FPS");
     HWND choices = GetDlgItem(hwnd, IDC_BUTTON_SELECT); SendMessageW(choices, CB_RESETCONTENT, 0, 0);
     for (const auto& button : state->buttons) SendMessageW(choices, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(button.name.c_str()));
     SendMessageW(choices, CB_SETCURSEL, 0, 0);
@@ -1451,6 +1568,7 @@ void PopulateSettings(HWND hwnd) {
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_SETPOS, TRUE, state->overlay.scalePercent);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_SETPOS, TRUE, state->overlay.opacityPercent);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_CORNER, CB_SETCURSEL, state->overlay.corner, 0);
+    SendDlgItemMessageW(hwnd, IDC_OVERLAY_STYLE, CB_SETCURSEL, state->overlay.layoutStyle, 0);
     SetNumericValue(hwnd, IDC_OVERLAY_MARGIN_X, IDC_OVERLAY_MARGIN_X_SPIN, state->overlay.marginX);
     SetNumericValue(hwnd, IDC_OVERLAY_MARGIN_Y, IDC_OVERLAY_MARGIN_Y_SPIN, state->overlay.marginY);
     SetText(hwnd, IDC_OVERLAY_SCALE_VALUE, std::to_wstring(state->overlay.scalePercent) + L"%");
@@ -1469,6 +1587,11 @@ bool ApplySettings(HWND hwnd) {
     }
     if (!ParseInteger(hwnd, IDC_COOLDOWN, cooldown) || cooldown < 50 || cooldown > 5000) {
         Message(hwnd, L"Settings", L"Action cooldown must be between 50 and 5000 ms.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 0); return false;
+    }
+    const bool baseFpsEnabled = SendDlgItemMessageW(hwnd, IDC_FPS_LIMIT_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const int baseFps = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_FPS_LIMIT, TBM_GETPOS, 0, 0));
+    if (baseFps < 30 || baseFps > 144) {
+        Message(hwnd, L"FPS limiter", L"FPS limit must be between 30 and 144.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 0); return false;
     }
     if (!ParseInteger(hwnd, IDC_BASE_STAPM, base.stapm) || !ParseInteger(hwnd, IDC_BASE_SLOW, base.slow) || !ParseInteger(hwnd, IDC_BASE_FAST, base.fast)) {
         Message(hwnd, L"Settings", L"All base TDP values must be whole numbers.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 2); return false;
@@ -1490,12 +1613,14 @@ bool ApplySettings(HWND hwnd) {
     overlay.scalePercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_GETPOS, 0, 0));
     overlay.opacityPercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_GETPOS, 0, 0));
     overlay.corner = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_CORNER, CB_GETCURSEL, 0, 0));
+    overlay.layoutStyle = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_STYLE, CB_GETCURSEL, 0, 0));
     if (!ParseInteger(hwnd, IDC_OVERLAY_MARGIN_X, overlay.marginX) || !ParseInteger(hwnd, IDC_OVERLAY_MARGIN_Y, overlay.marginY) ||
         overlay.marginX < 0 || overlay.marginX > 500 || overlay.marginY < 0 || overlay.marginY > 500) {
         Message(hwnd, L"Overlay", L"Overlay margins must be between 0 and 500.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 4); return false;
     }
     if (overlay.functionKey < 1 || overlay.functionKey > 24 || overlay.scalePercent < 50 || overlay.scalePercent > 200 ||
-        overlay.opacityPercent < 30 || overlay.opacityPercent > 100 || overlay.corner < 0 || overlay.corner > 3) {
+        overlay.opacityPercent < 30 || overlay.opacityPercent > 100 || overlay.corner < 0 || overlay.corner > 3 ||
+        overlay.layoutStyle < 0 || overlay.layoutStyle > 1) {
         Message(hwnd, L"Overlay", L"Overlay settings are invalid.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 4); return false;
     }
     const bool logging = SendDlgItemMessageW(hwnd, IDC_LOGGING, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -1509,7 +1634,9 @@ bool ApplySettings(HWND hwnd) {
         Message(hwnd, L"Settings", L"The Windows scheduled task could not be changed.", MB_OK | MB_ICONERROR); return false;
     }
     IniWriteInt(L"General", L"logging", logging ? 1 : 0); IniWriteInt(L"General", L"debounce_ms", debounce);
-    IniWriteInt(L"General", L"action_cooldown_ms", cooldown); IniWriteInt(L"TDP", L"BaseStapmW", base.stapm);
+    IniWriteInt(L"General", L"action_cooldown_ms", cooldown);
+    IniWriteInt(L"General", L"FpsLimitEnabled", baseFpsEnabled ? 1 : 0); IniWriteInt(L"General", L"FpsLimit", baseFps);
+    IniWriteInt(L"TDP", L"BaseStapmW", base.stapm);
     IniWriteInt(L"TDP", L"BaseFastW", base.fast); IniWriteInt(L"TDP", L"BaseSlowW", base.slow);
     IniWriteInt(L"Fan", L"Enabled", fanEnabled ? 1 : 0);
     for (std::size_t index = 0; index < LegionGoCore::kFanPointCount; ++index)
@@ -1522,6 +1649,7 @@ bool ApplySettings(HWND hwnd) {
     IniWriteInt(L"Overlay", L"OpacityPercent", overlay.opacityPercent);
     IniWriteInt(L"Overlay", L"Corner", overlay.corner);
     IniWriteInt(L"Overlay", L"MarginX", overlay.marginX); IniWriteInt(L"Overlay", L"MarginY", overlay.marginY);
+    IniWriteInt(L"Overlay", L"Style", overlay.layoutStyle);
     for (const auto& button : state->buttons) {
         IniWriteInt(button.name.c_str(), L"enabled", button.enabled ? 1 : 0);
         IniWrite(button.name.c_str(), L"trigger", button.triggerDown ? L"down" : L"up");
@@ -1531,7 +1659,8 @@ bool ApplySettings(HWND hwnd) {
         IniWrite(button.name.c_str(), L"internal", button.internal);
     }
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
-    state->startup = startup; state->base = base; state->debounce = debounce; state->cooldown = cooldown; state->overlay = overlay;
+    state->startup = startup; state->base = base; state->debounce = debounce; state->cooldown = cooldown;
+    state->baseFpsEnabled = baseFpsEnabled; state->baseFps = baseFps; state->overlay = overlay;
     LoadConfiguration(); LegionGoOverlay::SetVisible(overlay.enabledAtStartup);
     QueueWorker(fanEnabled ? WorkerJob::FanApply : WorkerJob::FanRestore);
     QueueWorker(WorkerJob::Wake); Balloon(L"Settings applied."); return true;
@@ -1568,7 +1697,14 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     HWND cooldownSpin = PageField(state, 0, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 292, y + 218, 22, 26, IDC_COOLDOWN_SPIN);
     ConfigureSpinner(cooldownSpin, cooldownEdit, 50, 5000);
     PageField(state, 0, hwnd, L"BUTTON", L"Open log", BS_PUSHBUTTON, x, y + 275, 110, 28, IDC_OPEN_LOG);
-    Label(state, 0, hwnd, L"Brightness uses the standard Windows WMI monitor interface. Battery changes are verified by the Lenovo backend.", x, y + 330, 760, 42);
+    PageField(state, 0, hwnd, L"BUTTON", L"Enable base FPS limit (AMD FRTC)", BS_AUTOCHECKBOX | WS_TABSTOP,
+              x, y + 325, 280, 26, IDC_FPS_LIMIT_ENABLE);
+    HWND fpsLimit = PageField(state, 0, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
+                              x + 285, y + 317, 360, 40, IDC_FPS_LIMIT);
+    SendMessageW(fpsLimit, TBM_SETRANGE, TRUE, MAKELONG(30, 144)); SendMessageW(fpsLimit, TBM_SETTICFREQ, 6, 0);
+    PageField(state, 0, hwnd, L"STATIC", L"60 FPS", SS_LEFT, x + 660, y + 325, 110, 24, IDC_FPS_LIMIT_VALUE);
+    Label(state, 0, hwnd, L"The limiter uses AMD Frame Rate Target Control with verified read-back and restores the previous Radeon setting on exit.", x, y + 375, 780, 42);
+    Label(state, 0, hwnd, L"Brightness uses standard Windows WMI. Battery changes are verified by the Lenovo backend.", x, y + 425, 760, 30);
 
     Label(state, 1, hwnd, L"Button:", x, y, 65, 22);
     HWND select = PageField(state, 1, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 65, y - 3, 150, 200, IDC_BUTTON_SELECT);
@@ -1626,6 +1762,11 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
 
     PageField(state, 4, hwnd, L"BUTTON", L"Show overlay now and at startup", BS_AUTOCHECKBOX | WS_TABSTOP,
               x, y, 300, 26, IDC_OVERLAY_ENABLE);
+    Label(state, 4, hwnd, L"Style:", x + 330, y + 3, 60, 24);
+    HWND overlayStyle = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+                                  x + 390, y, 190, 120, IDC_OVERLAY_STYLE);
+    SendMessageW(overlayStyle, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Vertical panel"));
+    SendMessageW(overlayStyle, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top performance bar"));
     Label(state, 4, hwnd, L"Toggle key:", x, y + 48, 110, 24);
     HWND overlayHotkey = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
                                    x + 120, y + 44, 130, 300, IDC_OVERLAY_HOTKEY);
@@ -1650,13 +1791,13 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 4, hwnd, L"Y margin:", x + 260, y + 236, 110, 24);
     HWND marginY = PageField(state, 4, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 370, y + 232, 70, 27, IDC_OVERLAY_MARGIN_Y, WS_EX_CLIENTEDGE);
     HWND marginYSpin = PageField(state, 4, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 442, y + 232, 22, 27, IDC_OVERLAY_MARGIN_Y_SPIN); ConfigureSpinner(marginYSpin, marginY, 0, 500);
-    Label(state, 4, hwnd, L"The overlay is topmost, click-through and does not inject code into games. FPS/frame-time use the bundled MIT PresentMon ETW collector.", x, y + 300, 800, 48);
+    Label(state, 4, hwnd, L"The overlay is topmost, click-through and does not inject code into games. FPS/frame-time use native real-time DXGI/D3D9 ETW events.", x, y + 300, 800, 48);
     Label(state, 4, hwnd, L"Some protected or exclusive-fullscreen games may hide a normal Windows overlay. Unavailable sensors are shown as N/A.", x, y + 360, 800, 40);
     PageField(state, 4, hwnd, L"STATIC", L"Updates once per second. Hotkey changes take effect after Apply.", SS_LEFT, x, y + 425, 800, 28, IDC_OVERLAY_STATUS);
 
     Label(state, 5, hwnd, APP_VERSION, x, y, 760, 30);
     Label(state, 5, hwnd,
-          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, custom fan curves, performance overlay, and automatically applies per-application TDP profiles while following launcher child processes.",
+          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, custom fan curves, an AMD FRTC limiter, performance overlay, and automatically applies per-application TDP profiles while following launcher child processes.",
           x, y + 48, 790, 100);
     Label(state, 5, hwnd, L"Repository:", x, y + 175, 120, 24);
     PageField(state, 5, hwnd, L"BUTTON", L"Open GitHub repository", BS_PUSHBUTTON | WS_TABSTOP,
@@ -1713,6 +1854,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                 g_requestedBrightness.store(position);
                 QueueWorker(WorkerJob::BrightnessSet);
                 return 0;
+            }
+            if (state && reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_FPS_LIMIT)) {
+                const int value = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_FPS_LIMIT, TBM_GETPOS, 0, 0));
+                SetText(hwnd, IDC_FPS_LIMIT_VALUE, std::to_wstring(value) + L" FPS"); return 0;
             }
             if (state && reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_OVERLAY_SCALE)) {
                 const int value = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_GETPOS, 0, 0));
@@ -1815,7 +1960,9 @@ void UpdateSettingsRuntime() {
     std::wstring text = status.profileActive ? L"Active profile: " + status.profileName : L"Active target: Base";
     text += L" - STAPM " + std::to_wstring(status.desired.stapm) + L" / SLOW " +
             std::to_wstring(status.desired.slow) + L" / FAST " + std::to_wstring(status.desired.fast) + L" W";
+    text += status.fpsLimitEnabled ? L" | FPS limit " + std::to_wstring(status.fpsLimit) : L" | FPS limit off";
     if (status.applyKnown && !status.applyOk) text += L"\r\n" + status.error;
+    if (status.fpsLimitKnown && !status.fpsLimitOk) text += L"\r\nFPS limiter: " + status.fpsLimitError;
     SetText(g_settings, IDC_TDP_STATUS, text);
     HWND battery = GetDlgItem(g_settings, IDC_BATTERY);
     if (battery) {
@@ -1890,10 +2037,22 @@ LRESULT CALLBACK ProfileEditorProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             SetNumericValue(hwnd, IDC_PE_SLOW, IDC_PE_SLOW_SPIN, context->value.tdp.slow);
             SetNumericValue(hwnd, IDC_PE_FAST, IDC_PE_FAST_SPIN, context->value.tdp.fast);
             Control(hwnd, L"STATIC", L"Required order: STAPM <= SLOW <= FAST", SS_LEFT, 410, 137, 155, 38, 0);
-            Control(hwnd, L"STATIC", L"The executable must be an absolute .exe path. Matching uses the full normalized path.", SS_LEFT, 18, 180, 530, 35, 0);
-            Control(hwnd, L"BUTTON", L"OK", BS_DEFPUSHBUTTON, 382, 226, 80, 28, IDC_PE_OK); Control(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON, 470, 226, 80, 28, IDC_PE_CANCEL);
+            Control(hwnd, L"BUTTON", L"Limit FPS for this profile", BS_AUTOCHECKBOX | WS_TABSTOP, 18, 184, 190, 24, IDC_PE_FPS_ENABLE);
+            HWND profileFps = Control(hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, 210, 176, 250, 40, IDC_PE_FPS_LIMIT);
+            SendMessageW(profileFps, TBM_SETRANGE, TRUE, MAKELONG(30, 144)); SendMessageW(profileFps, TBM_SETTICFREQ, 6, 0);
+            SendMessageW(profileFps, TBM_SETPOS, TRUE, context->value.fpsLimit);
+            Control(hwnd, L"STATIC", (std::to_wstring(context->value.fpsLimit) + L" FPS").c_str(), SS_LEFT, 470, 184, 90, 24, IDC_PE_FPS_VALUE);
+            SendDlgItemMessageW(hwnd, IDC_PE_FPS_ENABLE, BM_SETCHECK, context->value.fpsLimitEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            Control(hwnd, L"STATIC", L"The executable must be an absolute .exe path. Matching uses the full normalized path.", SS_LEFT, 18, 230, 530, 35, 0);
+            Control(hwnd, L"BUTTON", L"OK", BS_DEFPUSHBUTTON, 382, 276, 80, 28, IDC_PE_OK); Control(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON, 470, 276, 80, 28, IDC_PE_CANCEL);
             return 0;
         }
+        case WM_HSCROLL:
+            if (reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_PE_FPS_LIMIT)) {
+                const int value = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_PE_FPS_LIMIT, TBM_GETPOS, 0, 0));
+                SetText(hwnd, IDC_PE_FPS_VALUE, std::to_wstring(value) + L" FPS"); return 0;
+            }
+            return DefWindowProcW(hwnd, message, wParam, lParam);
         case WM_COMMAND: {
             ProfileEditorContext* context = EditorData(hwnd); const int id = LOWORD(wParam); const int notification = HIWORD(wParam); if (!context) return 0;
             if ((id == IDC_PE_STAPM || id == IDC_PE_SLOW || id == IDC_PE_FAST) && notification == EN_CHANGE && !context->normalizingTdp) {
@@ -1913,6 +2072,8 @@ LRESULT CALLBACK ProfileEditorProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                                      IDC_PE_STAPM_SPIN, IDC_PE_SLOW_SPIN, IDC_PE_FAST_SPIN);
                 context->normalizingTdp = false;
                 LegionGoCore::GameProfile candidate; candidate.name = Trim(WindowText(GetDlgItem(hwnd, IDC_PE_NAME))); candidate.path = Trim(WindowText(GetDlgItem(hwnd, IDC_PE_PATH)));
+                candidate.fpsLimitEnabled = SendDlgItemMessageW(hwnd, IDC_PE_FPS_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                candidate.fpsLimit = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_PE_FPS_LIMIT, TBM_GETPOS, 0, 0));
                 if (!FileExists(candidate.path)) {
                     Message(hwnd, L"Profile", L"Select an existing executable file.", MB_OK | MB_ICONERROR); return 0;
                 }
@@ -1937,7 +2098,7 @@ bool EditProfileModal(HWND owner, ProfileEditorContext& context) {
     const UINT dpi = WindowDpi(owner);
     HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, PROFILE_EDITOR_CLASS, context.editing == LegionGoCore::kNoProfile ? L"Add game profile" : L"Edit game profile",
                                   WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
-                                  DpiScale(584, dpi), DpiScale(310, dpi), owner, nullptr, g_instance, &context);
+                                  DpiScale(584, dpi), DpiScale(360, dpi), owner, nullptr, g_instance, &context);
     if (!window) { EnableWindow(owner, TRUE); return false; }
     CenterWindow(window, owner); ShowWindow(window, SW_SHOW); SetForegroundWindow(window);
     MSG message{};
@@ -1962,8 +2123,10 @@ void FillProfileList(HWND hwnd) {
         ListView_SetItemText(list, static_cast<int>(index), 2, const_cast<wchar_t*>(stapm.c_str()));
         ListView_SetItemText(list, static_cast<int>(index), 3, const_cast<wchar_t*>(slow.c_str()));
         ListView_SetItemText(list, static_cast<int>(index), 4, const_cast<wchar_t*>(fast.c_str()));
+        std::wstring fps = profiles[index].value.fpsLimitEnabled ? std::to_wstring(profiles[index].value.fpsLimit) : L"Base";
+        ListView_SetItemText(list, static_cast<int>(index), 5, const_cast<wchar_t*>(fps.c_str()));
         std::wstring status = runtime.profileActive && runtime.profileId == profiles[index].id ? (runtime.applyOk ? L"Active" : L"Error") : L"Idle";
-        ListView_SetItemText(list, static_cast<int>(index), 5, const_cast<wchar_t*>(status.c_str()));
+        ListView_SetItemText(list, static_cast<int>(index), 6, const_cast<wchar_t*>(status.c_str()));
     }
 }
 int SelectedProfile(HWND hwnd) { return ListView_GetNextItem(GetDlgItem(hwnd, IDC_PROFILE_LIST), -1, LVNI_SELECTED); }
@@ -1975,7 +2138,7 @@ LRESULT CALLBACK ProfilesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         case WM_CREATE: {
             HWND list = Control(hwnd, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, 12, 12, 916, 430, IDC_PROFILE_LIST, WS_EX_CLIENTEDGE);
             ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-            for (const auto& column : std::vector<std::pair<const wchar_t*, int>>{{L"Name",140},{L"Executable",470},{L"STAPM",70},{L"SLOW",65},{L"FAST",65},{L"Status",90}}) {
+            for (const auto& column : std::vector<std::pair<const wchar_t*, int>>{{L"Name",125},{L"Executable",385},{L"STAPM",65},{L"SLOW",60},{L"FAST",60},{L"FPS",65},{L"Status",80}}) {
                 LVCOLUMNW data{}; data.mask = LVCF_TEXT | LVCF_WIDTH; data.pszText = const_cast<wchar_t*>(column.first);
                 data.cx = DpiScale(column.second, WindowDpi(hwnd));
                 ListView_InsertColumn(list, Header_GetItemCount(ListView_GetHeader(list)), &data);
@@ -2179,6 +2342,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     if (!g_hidden) {
         if (g_icon) DestroyIcon(g_icon); if (g_windowIcon) DestroyIcon(g_windowIcon); if (g_font) DeleteObject(g_font);
         if (g_singleton) { ReleaseMutex(g_singleton); CloseHandle(g_singleton); } return 2;
+    }
+    std::wstring fpsRecoveryError;
+    if (!RestoreFpsBackup(fpsRecoveryError)) {
+        g_fpsLimiterReady = false; LogAlways(L"FPS limiter crash recovery failed: " + fpsRecoveryError);
     }
     if (!LegionGoOverlay::Initialize(instance, g_baseDir, g_overlayConfig))
         LogAlways(L"Overlay initialization failed (window unavailable).");

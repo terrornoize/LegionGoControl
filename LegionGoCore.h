@@ -52,6 +52,8 @@ struct GameProfile {
     std::wstring name;
     std::wstring path;
     TdpTriple tdp;
+    bool fpsLimitEnabled = false;
+    int fpsLimit = 60;
 };
 
 // Produces a lexical Windows path key: slash styles, redundant separators,
@@ -72,7 +74,8 @@ enum class ProfileValidationError {
     PathMustEndInExe,
     DuplicateName,
     DuplicatePath,
-    InvalidTdp
+    InvalidTdp,
+    InvalidFpsLimit
 };
 
 struct ProfileValidationIssue {

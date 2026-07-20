@@ -21,6 +21,8 @@ struct Config {
     int corner = 1;
     int marginX = 20;
     int marginY = 20;
+    // 0 = existing vertical panel, 1 = compact full-width top bar.
+    int layoutStyle = 0;
 };
 
 // Initialize and Shutdown must be called on the same window-message thread.
