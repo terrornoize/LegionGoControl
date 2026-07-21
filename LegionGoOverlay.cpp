@@ -664,8 +664,9 @@ private:
 
         if (compositionActive_) {
             if (compositionVisual3_ != nullptr) {
-                const HRESULT opacityResult = compositionVisual3_->SetOpacity(
-                    static_cast<float>(config.opacityPercent) / 100.0f);
+                // Opaque mode intentionally ignores the configured visual
+                // opacity: visual alpha makes FC25 fall back to DWM composition.
+                const HRESULT opacityResult = compositionVisual3_->SetOpacity(1.0f);
                 if (FAILED(opacityResult) || compositionDevice_ == nullptr ||
                     FAILED(compositionDevice_->Commit())) {
                     EnableLayeredFallback();
@@ -890,7 +891,9 @@ private:
         description.BufferCount = 2U;
         description.Scaling = DXGI_SCALING_STRETCH;
         description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        // A fully opaque composition surface is substantially more likely to
+        // receive an MPO plane on the Legion Go AMD driver than per-pixel alpha.
+        description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
         if (SUCCEEDED(result)) {
             result = factory->CreateSwapChainForComposition(d3dDevice_, &description, nullptr,
                                                              &compositionSwapChain_);
@@ -1025,19 +1028,12 @@ private:
         DrawLayout(compositionMemoryDc_, width, height);
         GdiFlush();
 
-        // GDI writes antialiased RGB coverage against the cleared black DIB
-        // but does not maintain alpha. The largest channel is a conservative
-        // coverage estimate and keeps every BGRA channel <= alpha, which is a
-        // valid premultiplied surface without turning edge pixels opaque.
+        // DXGI_ALPHA_MODE_IGNORE makes the complete compact rectangle opaque.
+        // Keep alpha initialized as well so captures/debuggers see valid BGRA.
         auto* pixels = static_cast<std::uint32_t*>(compositionBits_);
         const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
         for (std::size_t index = 0U; index < pixelCount; ++index) {
-            const std::uint32_t color = pixels[index] & 0x00ffffffU;
-            const std::uint32_t blue = color & 0xffU;
-            const std::uint32_t green = (color >> 8U) & 0xffU;
-            const std::uint32_t red = (color >> 16U) & 0xffU;
-            const std::uint32_t alpha = (std::max)(red, (std::max)(green, blue));
-            pixels[index] = color | (alpha << 24U);
+            pixels[index] |= 0xff000000U;
         }
 
         ID3D11Texture2D* backBuffer = nullptr;
@@ -1065,13 +1061,7 @@ private:
         ReleaseCompositionBackend();
         compositionActive_ = InitializeCompositionBackend();
         if (compositionActive_) {
-            Config config{};
-            {
-                std::lock_guard<std::mutex> lock(configMutex_);
-                config = config_;
-            }
-            const HRESULT opacityResult = compositionVisual3_->SetOpacity(
-                static_cast<float>(config.opacityPercent) / 100.0f);
+            const HRESULT opacityResult = compositionVisual3_->SetOpacity(1.0f);
             if (SUCCEEDED(opacityResult) && SUCCEEDED(compositionDevice_->Commit()) &&
                 RenderCompositionFrameOnce()) return;
         }
