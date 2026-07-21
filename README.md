@@ -31,7 +31,7 @@ The V2.1 tray is intentionally small:
 - **Open TDP setter** — opens the TDP tab in Settings;
 - **Settings...** — opens General, Controller, TDP, Fan, Overlay and Info settings;
 - **Game Profiles...** — manages per-executable TDP profiles;
-- version header (`LegionGoControl v2.1 YYYYMMDD`) and active target status;
+- version header (`LegionGoControl v2.1 YYYYMMDD #abcde`) and active target status;
 - **Exit**.
 
 Startup, battery limit and logging were moved from the tray into **Settings > General**.
@@ -69,7 +69,7 @@ M1 remains unsupported because it overlaps the normal RB/gamepad path on the tes
 
 ### Info
 
-The Info tab contains the current dated V2.1 version, a short English description, the GitHub repository link, hardware-beta notice, and the required attribution/link for the application icon.
+The Info tab contains the V2.1 version generated at build time from the commit date and its last five hexadecimal characters (`YYYYMMDD #abcde`), a short English description, the GitHub repository link, hardware-beta notice, and the required attribution/link for the application icon.
 
 ### TDP
 
@@ -307,7 +307,7 @@ LegionGoNativeWmiProbe.exe
 build\LegionGoCoreTests.exe
 ```
 
-The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release, embeds the application icon and includes the Per-Monitor DPI-aware manifest. Icon attribution is documented in `assets/README.md` and displayed in Settings > Info.
+The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release, embeds the application icon and includes the Per-Monitor DPI-aware manifest. `build.bat` generates `build/LegionGoBuildVersion.h` from the checked-out Git commit date and five-character short hash; Info, the tray menu and the tray tooltip therefore identify the source revision automatically. Icon attribution is documented in `assets/README.md` and displayed in Settings > Info.
 
 ## Non-hardware tests
 

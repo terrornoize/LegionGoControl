@@ -23,6 +23,13 @@
 #include "LegionGoOverlay.h"
 #include "resource.h"
 
+#if __has_include("build/LegionGoBuildVersion.h")
+#include "build/LegionGoBuildVersion.h"
+#else
+#define LEGIONGO_COMMIT_DATE L"unknown-date"
+#define LEGIONGO_COMMIT_SHORT L"local"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -52,7 +59,8 @@
 namespace {
 
 constexpr wchar_t APP_TITLE[] = L"LegionGoControl V2.1";
-constexpr wchar_t APP_VERSION[] = L"LegionGoControl v2.1 20260719";
+constexpr wchar_t APP_VERSION[] = L"LegionGoControl v2.1 " LEGIONGO_COMMIT_DATE L" #" LEGIONGO_COMMIT_SHORT;
+constexpr wchar_t APP_VERSION_SHORT[] = L"v2.1 " LEGIONGO_COMMIT_DATE L" #" LEGIONGO_COMMIT_SHORT;
 constexpr wchar_t REPOSITORY_URL[] = L"https://github.com/terrornoize/LegionGoControl";
 constexpr wchar_t HIDDEN_CLASS[] = L"LegionGoControlHiddenWindow";
 constexpr wchar_t SETTINGS_CLASS[] = L"LegionGoControlSettingsWindow";
@@ -2235,14 +2243,16 @@ HICON CreateTrayIcon() {
 bool AddTrayIcon(HWND hwnd) {
     ZeroMemory(&g_nid, sizeof(g_nid)); g_nid.cbSize = sizeof(g_nid); g_nid.hWnd = hwnd; g_nid.uID = 1;
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; g_nid.uCallbackMessage = WMAPP_TRAY; g_nid.hIcon = g_icon;
-    wcsncpy_s(g_nid.szTip, APP_TITLE, _TRUNCATE); const bool result = Shell_NotifyIconW(NIM_ADD, &g_nid) == TRUE;
+    wcsncpy_s(g_nid.szTip, APP_VERSION, _TRUNCATE); const bool result = Shell_NotifyIconW(NIM_ADD, &g_nid) == TRUE;
     g_nid.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &g_nid); return result;
 }
 unsigned g_presentedBatteryToggleSequence = 0;
 unsigned g_presentedBrightnessSetSequence = 0;
 unsigned g_presentedFanOperationSequence = 0;
 void UpdateTrayTip() {
-    const RuntimeStatus status = RuntimeSnapshot(); std::wstring tip = status.profileActive ? L"Active: " + status.profileName : L"Active: Base";
+    const RuntimeStatus status = RuntimeSnapshot();
+    std::wstring tip = std::wstring(APP_VERSION_SHORT) + L" | " +
+        (status.profileActive ? L"Active: " + status.profileName : L"Active: Base");
     tip += L" (STAPM " + std::to_wstring(status.desired.stapm) + L" / SLOW " +
            std::to_wstring(status.desired.slow) + L" / FAST " + std::to_wstring(status.desired.fast) + L" W)";
     NOTIFYICONDATAW copy = g_nid; copy.uFlags = NIF_TIP; wcsncpy_s(copy.szTip, tip.c_str(), _TRUNCATE); Shell_NotifyIconW(NIM_MODIFY, &copy);

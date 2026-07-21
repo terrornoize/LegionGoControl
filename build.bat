@@ -7,6 +7,19 @@ call :setup_x64 || exit /b 1
 set "BUILD_DIR=%CD%\build"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%" || exit /b 1
 
+set "COMMIT_DATE=unknown-date"
+set "COMMIT_SHORT=local"
+where git >nul 2>nul
+if not errorlevel 1 (
+    for /f "usebackq tokens=*" %%I in (`git -C "%CD%" log -1 --format^=%%cs 2^>nul`) do set "COMMIT_DATE=%%I"
+    for /f "usebackq tokens=*" %%I in (`git -C "%CD%" rev-parse --short^=5 HEAD 2^>nul`) do set "COMMIT_SHORT=%%I"
+)
+set "COMMIT_DATE=%COMMIT_DATE:-=%"
+> "%BUILD_DIR%\LegionGoBuildVersion.h" echo #pragma once
+>>"%BUILD_DIR%\LegionGoBuildVersion.h" echo #define LEGIONGO_COMMIT_DATE L"%COMMIT_DATE%"
+>>"%BUILD_DIR%\LegionGoBuildVersion.h" echo #define LEGIONGO_COMMIT_SHORT L"%COMMIT_SHORT%"
+echo Build version: %COMMIT_DATE% #%COMMIT_SHORT%
+
 set "CXXFLAGS=/nologo /std:c++17 /EHsc /W4 /O2 /utf-8 /DNDEBUG /DUNICODE /D_UNICODE"
 
 echo [1/3] Building LegionGoControl.exe (x64 Release)...
