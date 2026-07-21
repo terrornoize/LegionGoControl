@@ -1375,54 +1375,20 @@ private:
             if (WaitForSingleObject(stopEvent_, 0U) == WAIT_OBJECT_0) {
                 break;
             }
-            const bool visible = visible_.load();
-            if (!visible) {
-                if (wasVisible) {
-                    presentTrace.Stop();
-                    pdh.Close();
-                    dxgi.Close();
-                    telemetryOpen = false;
-                    havePreviousCpu = false;
-                    frameSamplesByProcess_.clear();
-                    selectedFrameProcessId_ = 0U;
-                    PublishSnapshot(Snapshot{});
-                }
-                wasVisible = false;
-                const DWORD waitResult = WaitForMultipleObjects(2U, waitHandles, FALSE, INFINITE);
-                if (waitResult == WAIT_OBJECT_0) {
-                    break;
-                }
-                continue;
-            }
-
-            if (!wasVisible) {
-                pdh.Open();
-                dxgi.Open();
-                telemetryOpen = true;
-                nextMetric = SteadyClock::now();
-                nextPresentTraceStart = SteadyClock::now();
-                wasVisible = true;
-            }
-
-            // Refresh this on the worker as well as during monitor layout so a
-            // target switch is visible to FPS selection without an extra
-            // one-second publication/layout cycle.
-            DWORD observedForegroundProcess = 0U;
-            const HWND observedForegroundWindow = GetForegroundWindow();
-            if (observedForegroundWindow != nullptr) {
-                GetWindowThreadProcessId(observedForegroundWindow, &observedForegroundProcess);
-            }
-            foregroundProcessId_.store(observedForegroundProcess);
+            // FPS capture has an application lifetime independent from F10.
+            // Hiding the window must never restart ETW or discard graph data.
             const SteadyClock::time_point now = SteadyClock::now();
             bool fpsCaptureEnabled = true;
             {
                 std::lock_guard<std::mutex> lock(configMutex_);
                 fpsCaptureEnabled = config_.fpsCaptureEnabled;
             }
-
-            // Keep one continuous session while the overlay is visible, as in
-            // the first native-FPS implementation. No desktop/game foreground
-            // transitions are allowed to stop, restart, or reset this stream.
+            DWORD observedForegroundProcess = 0U;
+            const HWND observedForegroundWindow = GetForegroundWindow();
+            if (observedForegroundWindow != nullptr) {
+                GetWindowThreadProcessId(observedForegroundWindow, &observedForegroundProcess);
+            }
+            foregroundProcessId_.store(observedForegroundProcess);
             if (fpsCaptureEnabled) {
                 if (!presentTrace.Running() && now >= nextPresentTraceStart) {
                     if (!presentTrace.Start()) nextPresentTraceStart = now + std::chrono::seconds(2);
@@ -1432,6 +1398,30 @@ private:
                 presentTrace.Stop();
                 frameSamplesByProcess_.clear();
                 selectedFrameProcessId_ = 0U;
+            }
+
+            const bool visible = visible_.load();
+            if (!visible) {
+                if (wasVisible) {
+                    pdh.Close();
+                    dxgi.Close();
+                    telemetryOpen = false;
+                    havePreviousCpu = false;
+                    PublishSnapshot(Snapshot{});
+                }
+                wasVisible = false;
+                const DWORD waitResult = WaitForMultipleObjects(2U, waitHandles, FALSE,
+                    fpsCaptureEnabled ? 50U : INFINITE);
+                if (waitResult == WAIT_OBJECT_0) break;
+                continue;
+            }
+
+            if (!wasVisible) {
+                pdh.Open();
+                dxgi.Open();
+                telemetryOpen = true;
+                nextMetric = now;
+                wasVisible = true;
             }
 
             if (telemetryOpen && now >= nextMetric) {

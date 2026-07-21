@@ -1830,7 +1830,7 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 4, hwnd, L"Y margin:", x + 260, y + 236, 110, 24);
     HWND marginY = PageField(state, 4, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 370, y + 232, 70, 27, IDC_OVERLAY_MARGIN_Y, WS_EX_CLIENTEDGE);
     HWND marginYSpin = PageField(state, 4, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 442, y + 232, 22, 27, IDC_OVERLAY_MARGIN_Y_SPIN); ConfigureSpinner(marginYSpin, marginY, 0, 500);
-    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS uses one continuous ETW session while the overlay is visible.", x, y + 300, 800, 48);
+    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS capture stays continuous when F10 hides or shows the window.", x, y + 300, 800, 48);
     Label(state, 4, hwnd, L"Some protected or exclusive-fullscreen games may hide a normal Windows overlay. Unavailable sensors are shown as N/A.", x, y + 360, 800, 40);
     PageField(state, 4, hwnd, L"STATIC", L"Updates once per second. Hotkey changes take effect after Apply.", SS_LEFT, x, y + 425, 800, 28, IDC_OVERLAY_STATUS);
 
