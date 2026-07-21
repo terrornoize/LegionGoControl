@@ -74,17 +74,6 @@ struct FrameSample {
     SteadyClock::time_point received{};
 };
 
-bool IsWindowsDesktopForeground(HWND window) {
-    if (window == nullptr) return true;
-    const HWND root = GetAncestor(window, GA_ROOT);
-    const HWND shell = GetShellWindow();
-    if (window == shell || root == shell || window == GetDesktopWindow()) return true;
-    wchar_t className[128]{};
-    GetClassNameW(root != nullptr ? root : window, className, static_cast<int>(_countof(className)));
-    return _wcsicmp(className, L"Progman") == 0 || _wcsicmp(className, L"WorkerW") == 0 ||
-           _wcsicmp(className, L"Shell_TrayWnd") == 0 || _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0;
-}
-
 Config SanitizeConfig(const Config& input) {
     Config result = input;
     result.functionKey = (std::max)(1, (std::min)(24, result.functionKey));
@@ -604,7 +593,7 @@ private:
         }
         activeFunctionKey_ = 0;
         activeHotKeyId_ = kHotKeyIdA;
-        foregroundState_.store(1ULL << 32U);
+        foregroundProcessId_.store(0U);
         {
             std::lock_guard<std::mutex> firmwareLock(firmwareMutex_);
             firmwareTemperatureC_ = 0;
@@ -742,8 +731,7 @@ private:
         if (target != nullptr) {
             GetWindowThreadProcessId(target, &targetProcessId);
         }
-        foregroundState_.store((IsWindowsDesktopForeground(target) ? (1ULL << 32U) : 0ULL) |
-                               static_cast<unsigned long long>(targetProcessId));
+        foregroundProcessId_.store(targetProcessId);
         HMONITOR monitor = MonitorFromWindow(target != nullptr ? target : window_, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO information{};
         information.cbSize = sizeof(information);
@@ -1239,13 +1227,7 @@ private:
         // Retain an overlap across one-second publications so a short ETW
         // scheduling gap does not make otherwise continuous presents blink.
         const SteadyClock::time_point rollingStart = now - std::chrono::milliseconds(2500);
-        const unsigned long long foregroundState = foregroundState_.load();
-        if ((foregroundState & (1ULL << 32U)) != 0U) {
-            frameSamplesByProcess_.clear();
-            selectedFrameProcessId_ = 0U;
-            return;
-        }
-        const DWORD foregroundProcess = static_cast<DWORD>(foregroundState & 0xffffffffULL);
+        const DWORD foregroundProcess = foregroundProcessId_.load();
         DWORD targetProcess = 0U;
         const auto foregroundSamples = frameSamplesByProcess_.find(foregroundProcess);
         if (foregroundSamples != frameSamplesByProcess_.end()) {
@@ -1376,7 +1358,6 @@ private:
     }
 
     void WorkerMain() {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         LegionGoPresentTrace::Collector presentTrace;
         PdhMetrics pdh;
         DxgiMetrics dxgi;
@@ -1388,9 +1369,6 @@ private:
         bool wasVisible = false;
         SteadyClock::time_point nextMetric = SteadyClock::now();
         SteadyClock::time_point nextPresentTraceStart = SteadyClock::now();
-        SteadyClock::time_point traceIntentSince = SteadyClock::now();
-        bool traceIntent = false;
-        bool stableTraceEnabled = false;
 
         HANDLE waitHandles[2]{stopEvent_, wakeEvent_};
         for (;;) {
@@ -1423,9 +1401,6 @@ private:
                 telemetryOpen = true;
                 nextMetric = SteadyClock::now();
                 nextPresentTraceStart = SteadyClock::now();
-                traceIntentSince = SteadyClock::now();
-                traceIntent = false;
-                stableTraceEnabled = false;
                 wasVisible = true;
             }
 
@@ -1437,9 +1412,7 @@ private:
             if (observedForegroundWindow != nullptr) {
                 GetWindowThreadProcessId(observedForegroundWindow, &observedForegroundProcess);
             }
-            const bool foregroundIsDesktop = IsWindowsDesktopForeground(observedForegroundWindow);
-            foregroundState_.store((foregroundIsDesktop ? (1ULL << 32U) : 0ULL) |
-                                   static_cast<unsigned long long>(observedForegroundProcess));
+            foregroundProcessId_.store(observedForegroundProcess);
             const SteadyClock::time_point now = SteadyClock::now();
             bool fpsCaptureEnabled = true;
             {
@@ -1447,37 +1420,18 @@ private:
                 fpsCaptureEnabled = config_.fpsCaptureEnabled;
             }
 
-            // Configuration-off is immediate. Only shell/game foreground
-            // transitions are debounced to avoid ETW session churn.
-            if (!fpsCaptureEnabled) {
-                if (stableTraceEnabled || traceIntent || presentTrace.Running()) presentTrace.Stop();
-                stableTraceEnabled = false;
-                traceIntent = false;
-                frameSamplesByProcess_.clear();
-                selectedFrameProcessId_ = 0U;
-            } else {
-                const bool requestedTrace = !foregroundIsDesktop;
-                if (requestedTrace != traceIntent) {
-                    traceIntent = requestedTrace;
-                    traceIntentSince = now;
-                }
-                if (traceIntent != stableTraceEnabled &&
-                    now - traceIntentSince >= std::chrono::milliseconds(750)) {
-                    stableTraceEnabled = traceIntent;
-                    if (!stableTraceEnabled) {
-                        presentTrace.Stop();
-                        frameSamplesByProcess_.clear();
-                        selectedFrameProcessId_ = 0U;
-                    } else {
-                        nextPresentTraceStart = now;
-                    }
-                }
-            }
-            if (fpsCaptureEnabled && stableTraceEnabled) {
+            // Keep one continuous session while the overlay is visible, as in
+            // the first native-FPS implementation. No desktop/game foreground
+            // transitions are allowed to stop, restart, or reset this stream.
+            if (fpsCaptureEnabled) {
                 if (!presentTrace.Running() && now >= nextPresentTraceStart) {
                     if (!presentTrace.Start()) nextPresentTraceStart = now + std::chrono::seconds(2);
                 }
                 for (const auto& frame : presentTrace.Drain()) AddFrame(frame.processId, frame.milliseconds, 0U);
+            } else if (presentTrace.Running()) {
+                presentTrace.Stop();
+                frameSamplesByProcess_.clear();
+                selectedFrameProcessId_ = 0U;
             }
 
             if (telemetryOpen && now >= nextMetric) {
@@ -1510,8 +1464,7 @@ private:
     mutable std::mutex firmwareMutex_;
     std::atomic<bool> initialized_{false};
     std::atomic<bool> visible_{false};
-    // Low 32 bits: PID. Bit 32: Windows desktop/taskbar foreground.
-    std::atomic<unsigned long long> foregroundState_{1ULL << 32U};
+    std::atomic<DWORD> foregroundProcessId_{0U};
     HINSTANCE instance_ = nullptr;
     HWND window_ = nullptr;
     ATOM classAtom_ = 0U;

@@ -25,28 +25,6 @@ constexpr USHORT kDxgiPresentStart = 0x002a;
 constexpr USHORT kD3d9PresentStart = 0x0001;
 constexpr ULONGLONG kPresentKeyword = 0x8000000000000002ULL;
 
-struct SingleEventIdFilter {
-    BOOLEAN filterIn = TRUE;
-    UCHAR reserved = 0;
-    USHORT count = 1;
-    USHORT eventId = 0;
-};
-
-ULONG EnableOnlyEvent(TRACEHANDLE session, const GUID& provider, USHORT eventId) {
-    SingleEventIdFilter filter{};
-    filter.eventId = eventId;
-    EVENT_FILTER_DESCRIPTOR descriptor{};
-    descriptor.Ptr = reinterpret_cast<ULONGLONG>(&filter);
-    descriptor.Size = sizeof(filter);
-    descriptor.Type = EVENT_FILTER_TYPE_EVENT_ID;
-    ENABLE_TRACE_PARAMETERS parameters{};
-    parameters.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
-    parameters.EnableFilterDesc = &descriptor;
-    parameters.FilterDescCount = 1;
-    return EnableTraceEx2(session, &provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                          TRACE_LEVEL_VERBOSE, kPresentKeyword, 0, 0, &parameters);
-}
-
 std::vector<unsigned char> PropertiesBuffer() {
     std::vector<unsigned char> bytes(sizeof(EVENT_TRACE_PROPERTIES) + sizeof(kSessionName));
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(bytes.data());
@@ -120,10 +98,15 @@ bool Collector::Start() {
     ULONG status = StartTraceW(&impl_->session, kSessionName,
                                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(bytes.data()));
     if (status != ERROR_SUCCESS) { impl_->session = 0; return false; }
-    // Filter in the providers, not merely in our callback. Without this ETW
-    // would deliver every analytic DXGI/D3D9 event and could disturb games.
-    status = EnableOnlyEvent(impl_->session, kDxgiProvider, kDxgiPresentStart);
-    if (status == ERROR_SUCCESS) status = EnableOnlyEvent(impl_->session, kD3d9Provider, kD3d9PresentStart);
+    // Restore the original continuous collector behavior used by the first
+    // native-FPS release. Filtering remains in OnEvent, while the provider
+    // session itself is left stable for the whole visible-overlay lifetime.
+    status = EnableTraceEx2(impl_->session, &kDxgiProvider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                            TRACE_LEVEL_VERBOSE, kPresentKeyword, 0, 0, nullptr);
+    if (status == ERROR_SUCCESS) {
+        status = EnableTraceEx2(impl_->session, &kD3d9Provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                TRACE_LEVEL_VERBOSE, kPresentKeyword, 0, 0, nullptr);
+    }
     if (status != ERROR_SUCCESS) { Stop(); return false; }
     QueryPerformanceFrequency(&impl_->frequency);
     {
@@ -141,7 +124,6 @@ bool Collector::Start() {
     const TRACEHANDLE openedTrace = impl_->trace;
     try {
         impl_->thread = std::thread([this, openedTrace] {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             TRACEHANDLE handle = openedTrace;
             ProcessTrace(&handle, 1, nullptr, nullptr);
             impl_->running.store(false);

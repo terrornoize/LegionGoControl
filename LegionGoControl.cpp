@@ -359,7 +359,7 @@ void CreateDefaultConfiguration() {
         IniWriteInt(L"Fan", (L"Duty" + std::to_wstring(index)).c_str(), fanDefaults[index]);
     IniWrite(L"FanProfiles", L"Order", L"");
     IniWriteInt(L"Overlay", L"VisibleAtStartup", 0);
-    IniWriteInt(L"Overlay", L"FpsCaptureEnabled", 0);
+    IniWriteInt(L"Overlay", L"FpsCaptureEnabled", 1);
     IniWriteInt(L"Overlay", L"FunctionKey", 10);
     IniWriteInt(L"Overlay", L"ScalePercent", 100);
     IniWriteInt(L"Overlay", L"OpacityPercent", 85);
@@ -893,7 +893,7 @@ void LoadConfiguration() {
     fanCurve = selectedFan->curve;
     LegionGoOverlay::Config overlay;
     overlay.enabledAtStartup = IniInt(L"Overlay", L"VisibleAtStartup", 0) != 0;
-    overlay.fpsCaptureEnabled = IniInt(L"Overlay", L"FpsCaptureEnabled", 0) != 0;
+    overlay.fpsCaptureEnabled = IniInt(L"Overlay", L"FpsCaptureEnabled", 1) != 0;
     overlay.functionKey = (std::max)(1, (std::min)(24, IniInt(L"Overlay", L"FunctionKey", 10)));
     overlay.scalePercent = (std::max)(50, (std::min)(200, IniInt(L"Overlay", L"ScalePercent", 100)));
     overlay.opacityPercent = (std::max)(0, (std::min)(100, IniInt(L"Overlay", L"OpacityPercent", 85)));
@@ -1800,7 +1800,7 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     HWND overlayHotkey = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
                                    x + 120, y + 44, 130, 300, IDC_OVERLAY_HOTKEY);
     for (int key = 1; key <= 24; ++key) SendMessageW(overlayHotkey, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>((L"F" + std::to_wstring(key)).c_str()));
-    PageField(state, 4, hwnd, L"BUTTON", L"Capture FPS with filtered ETW", BS_AUTOCHECKBOX | WS_TABSTOP,
+    PageField(state, 4, hwnd, L"BUTTON", L"Capture FPS (continuous ETW)", BS_AUTOCHECKBOX | WS_TABSTOP,
               x + 330, y + 46, 330, 26, IDC_OVERLAY_FPS_CAPTURE);
     Label(state, 4, hwnd, L"Scale:", x, y + 94, 110, 24);
     HWND overlayScale = PageField(state, 4, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
@@ -1822,7 +1822,7 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     Label(state, 4, hwnd, L"Y margin:", x + 260, y + 236, 110, 24);
     HWND marginY = PageField(state, 4, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 370, y + 232, 70, 27, IDC_OVERLAY_MARGIN_Y, WS_EX_CLIENTEDGE);
     HWND marginYSpin = PageField(state, 4, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 442, y + 232, 22, 27, IDC_OVERLAY_MARGIN_Y_SPIN); ConfigureSpinner(marginYSpin, marginY, 0, 500);
-    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS capture uses event-filtered ETW only outside the Windows desktop.", x, y + 300, 800, 48);
+    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS uses one continuous ETW session while the overlay is visible.", x, y + 300, 800, 48);
     Label(state, 4, hwnd, L"Some protected or exclusive-fullscreen games may hide a normal Windows overlay. Unavailable sensors are shown as N/A.", x, y + 360, 800, 40);
     PageField(state, 4, hwnd, L"STATIC", L"Updates once per second. Hotkey changes take effect after Apply.", SS_LEFT, x, y + 425, 800, 28, IDC_OVERLAY_STATUS);
 

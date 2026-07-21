@@ -15,7 +15,7 @@ namespace LegionGoOverlay {
 // corner: 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right.
 struct Config {
     bool enabledAtStartup = false;
-    bool fpsCaptureEnabled = false;
+    bool fpsCaptureEnabled = true;
     int functionKey = 10;
     int scalePercent = 100;
     int opacityPercent = 85;
