@@ -110,7 +110,7 @@ Two layouts are available: the original vertical panel and a compact full-width 
 Metrics update once per second and are rendered in this fixed order:
 
 1. FPS;
-2. rolling frame-pacing graph (numeric frame time is hidden; the mini graph is omitted below 1600 pixels to preserve readable text);
+2. rolling frame-pacing graph (numeric frame time is hidden; the mini graph remains visible at 1280x800);
 3. CPU usage;
 4. CPU temperature;
 5. CPU package power;

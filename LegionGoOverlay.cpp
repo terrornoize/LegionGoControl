@@ -921,6 +921,16 @@ private:
                 return GetTextExtentPoint32W(targetDc, textValue.c_str(),
                     static_cast<int>(textValue.size()), &size) != FALSE ? size.cx : 0;
             };
+            // Reserve exactly two rendered spaces after the FPS area. Shift
+            // every following metric together; keep the clock right edge fixed.
+            const int afterFpsShift = textWidth(L"  ");
+            segments[0].right = (std::min)(layoutWidth, segments[0].right + afterFpsShift);
+            for (int index = 1; index <= 5; ++index) {
+                segments[index].left = (std::min)(layoutWidth, segments[index].left + afterFpsShift);
+                segments[index].right = (std::min)(layoutWidth, segments[index].right + afterFpsShift);
+            }
+            segments[6].left = (std::min)(segments[6].right, segments[6].left + afterFpsShift);
+
             const auto drawPair = [targetDc, gap, &textWidth, white](RECT rect, const wchar_t* label,
                                                                     COLORREF color,
                                                                     const std::wstring& value) {
@@ -961,7 +971,7 @@ private:
             const int graphInset = (std::max)(2, static_cast<int>(std::lround((lowResolutionMode ? 3.0 : 9.0) * textScale)));
             RECT miniGraph{fpsValueRect.right + gap, fpsRect.top + graphInset,
                            fpsRect.right, fpsRect.bottom - graphInset};
-            if (!lowResolutionMode) PaintMiniGraph(targetDc, miniGraph, snapshot.frameHistory, textScale, yellow);
+            PaintMiniGraph(targetDc, miniGraph, snapshot.frameHistory, textScale, yellow);
 
             const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + L"  " +
                 (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + L"  " +
