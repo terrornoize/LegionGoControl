@@ -110,18 +110,17 @@ Two layouts are available: the original vertical panel and a compact full-width 
 Metrics update once per second and are rendered in this fixed order:
 
 1. FPS;
-2. rolling frame-pacing graph (numeric frame time is hidden; the mini graph remains visible at 1280x800);
-3. CPU usage;
-4. CPU temperature;
-5. CPU package power;
-6. GPU usage;
-7. VRAM used / configured total;
-8. occupied RAM / total RAM;
-9. fan RPM;
-10. remaining battery percentage;
-11. local time in 24-hour format.
+2. CPU usage;
+3. CPU temperature;
+4. CPU package power;
+5. GPU usage;
+6. VRAM used / configured total;
+7. occupied RAM / total RAM;
+8. fan RPM;
+9. remaining battery percentage;
+10. local time in 24-hour format.
 
-When **Capture FPS (continuous ETW)** is enabled, FPS and frame pacing use the original native collector from the first FPS release: one real-time `Microsoft-Windows-DXGI` / `Microsoft-Windows-D3D9` ETW session remains active for the application lifetime. Desktop/foreground transitions and F10 visibility toggles never stop or restart it; hiding the overlay preserves the rolling samples and frame-pacing graph. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. This intentionally restores the earlier behavior, including the possibility of seeing a dominant desktop graphics stream instead of suppressing FPS on Windows. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
+When **Capture FPS (continuous ETW)** is enabled, FPS uses the original native collector from the first FPS release: one real-time `Microsoft-Windows-DXGI` / `Microsoft-Windows-D3D9` ETW session remains active for the application lifetime. Desktop/foreground transitions and F10 visibility toggles never stop or restart it; hiding the overlay preserves the rolling FPS samples. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. This intentionally restores the earlier behavior, including the possibility of seeing a dominant desktop graphics stream instead of suppressing FPS on Windows. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
 
 Because the overlay deliberately avoids game injection, a protected game or true exclusive-fullscreen presentation may cover it. Borderless/windowed fullscreen is the most compatible mode.
 
@@ -353,7 +352,7 @@ Before daily use, validate on the actual device:
 9. Backend timeout/failure is shown as an error and does not claim success.
 10. Fan profiles survive restart and selecting each profile restores its ten saved points.
 11. The overlay hotkey toggles without focusing it; values refresh once per second and clicks pass through to the game.
-12. Compare FPS/pacing graph with another trusted counter and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
+12. Compare FPS with another trusted counter and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
 13. Enable a harmless 60 FPS base limit, verify AMD Radeon Chill min/max read-back, disable it, and confirm the previous Radeon state is restored.
 14. Configure a different Game Profile FPS target and verify base/profile switching and final restore.
 

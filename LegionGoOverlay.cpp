@@ -66,7 +66,6 @@ struct Snapshot {
     bool firmwareKnown = false;
     SYSTEMTIME localTime{};
     bool timeKnown = false;
-    std::vector<double> frameHistory;
 };
 
 struct FrameSample {
@@ -921,20 +920,6 @@ private:
                 return GetTextExtentPoint32W(targetDc, textValue.c_str(),
                     static_cast<int>(textValue.size()), &size) != FALSE ? size.cx : 0;
             };
-            // Reserve exactly two rendered spaces after the FPS area. Shift
-            // every following metric together; keep the clock right edge fixed.
-            const int afterFpsShift = textWidth(L"  ");
-            const auto shiftedCoordinate = [layoutWidth, afterFpsShift](LONG coordinate) {
-                return static_cast<LONG>((std::min)(layoutWidth, static_cast<int>(coordinate) + afterFpsShift));
-            };
-            segments[0].right = shiftedCoordinate(segments[0].right);
-            for (int index = 1; index <= 5; ++index) {
-                segments[index].left = shiftedCoordinate(segments[index].left);
-                segments[index].right = shiftedCoordinate(segments[index].right);
-            }
-            segments[6].left = (std::min)(segments[6].right,
-                                          static_cast<LONG>(segments[6].left + afterFpsShift));
-
             const auto drawPair = [targetDc, gap, &textWidth, white](RECT rect, const wchar_t* label,
                                                                     COLORREF color,
                                                                     const std::wstring& value) {
@@ -953,8 +938,7 @@ private:
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             };
 
-            // Numeric frame time is intentionally hidden for now. The compact
-            // graph remains available as the immediate pacing indicator.
+            // Numeric frame time is intentionally hidden for now.
             const std::wstring fpsValue = FormatNumber(snapshot.fps, L"%.0f");
             RECT fpsRect = segments[0];
             const int fpsWidth = static_cast<int>(fpsRect.right - fpsRect.left);
@@ -972,10 +956,6 @@ private:
             SetTextColor(targetDc, white);
             DrawTextW(targetDc, fpsValue.c_str(), -1, &fpsValueRect,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            const int graphInset = (std::max)(2, static_cast<int>(std::lround((lowResolutionMode ? 3.0 : 9.0) * textScale)));
-            RECT miniGraph{fpsValueRect.right + gap, fpsRect.top + graphInset,
-                           fpsRect.right, fpsRect.bottom - graphInset};
-            PaintMiniGraph(targetDc, miniGraph, snapshot.frameHistory, textScale, yellow);
 
             const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + L"  " +
                 (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + L"  " +
@@ -1025,7 +1005,6 @@ private:
 
             const int padding = (std::max)(4, static_cast<int>(std::lround(12.0 * scale)));
             const int rowHeight = (std::max)(11, static_cast<int>(std::lround(22.0 * scale)));
-            const int graphHeight = (std::max)(20, static_cast<int>(std::lround(48.0 * scale)));
             const int valueLeft = static_cast<int>(std::lround(130.0 * scale));
             int y = padding;
             for (std::size_t index = 0U; index < rows.size(); ++index) {
@@ -1038,11 +1017,6 @@ private:
                 DrawTextW(targetDc, rows[index].second.c_str(), -1, &valueRect,
                           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
                 y += rowHeight;
-                if (index == 0U) {
-                    RECT graphRect{padding, y, width - padding, (std::min)(height - padding, y + graphHeight)};
-                    PaintGraph(targetDc, graphRect, snapshot.frameHistory, scale);
-                    y += graphHeight;
-                }
             }
         }
 
@@ -1061,107 +1035,6 @@ private:
             DeleteDC(bufferDc);
         }
         EndPaint(window, &paint);
-    }
-
-    static void PaintMiniGraph(HDC dc, const RECT& rect, const std::vector<double>& history,
-                               double scale, COLORREF color) {
-        const int graphWidth = rect.right - rect.left;
-        const int graphHeight = rect.bottom - rect.top;
-        if (graphWidth <= 2 || graphHeight <= 2 || history.empty()) {
-            return;
-        }
-
-        double maximum = 50.0;
-        for (double value : history) {
-            if (std::isfinite(value)) {
-                maximum = (std::max)(maximum, (std::min)(100.0, value));
-            }
-        }
-        const int penWidth = (std::max)(1, static_cast<int>(std::lround(scale)));
-        HPEN pen = CreatePen(PS_SOLID, penWidth, color);
-        if (pen == nullptr) {
-            return;
-        }
-        HGDIOBJ oldPen = SelectObject(dc, pen);
-        const std::size_t count = history.size();
-        for (std::size_t index = 0U; index < count; ++index) {
-            const int x = count <= 1U ? rect.right - 1 :
-                rect.left + static_cast<int>((static_cast<unsigned long long>(index) *
-                static_cast<unsigned long long>(graphWidth - 1)) /
-                static_cast<unsigned long long>(count - 1U));
-            const double normalized = (std::max)(0.0, (std::min)(maximum, history[index])) / maximum;
-            const int y = rect.bottom - 1 -
-                static_cast<int>(std::lround(normalized * static_cast<double>(graphHeight - 2)));
-            if (index == 0U) {
-                MoveToEx(dc, x, y, nullptr);
-            } else {
-                LineTo(dc, x, y);
-            }
-        }
-        SelectObject(dc, oldPen);
-        DeleteObject(pen);
-    }
-
-    static void PaintGraph(HDC dc, const RECT& rect, const std::vector<double>& history, double scale) {
-        HBRUSH graphBackground = CreateSolidBrush(RGB(22, 27, 34));
-        FillRect(dc, &rect, graphBackground != nullptr ? graphBackground :
-                 static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        if (graphBackground != nullptr) {
-            DeleteObject(graphBackground);
-        }
-
-        const int graphWidth = rect.right - rect.left;
-        const int graphHeight = rect.bottom - rect.top;
-        if (graphWidth <= 2 || graphHeight <= 2) {
-            return;
-        }
-
-        double maximum = 50.0;
-        for (double value : history) {
-            if (std::isfinite(value)) {
-                maximum = (std::max)(maximum, (std::min)(100.0, value));
-            }
-        }
-        const auto mapY = [&rect, graphHeight, maximum](double value) {
-            const double normalized = (std::max)(0.0, (std::min)(maximum, value)) / maximum;
-            return rect.bottom - 1 - static_cast<int>(std::lround(normalized * static_cast<double>(graphHeight - 2)));
-        };
-
-        HPEN guidePen = CreatePen(PS_DOT, 1, RGB(62, 70, 79));
-        HGDIOBJ oldPen = guidePen == nullptr ? nullptr : SelectObject(dc, guidePen);
-        if (guidePen != nullptr) {
-            for (double guide : {16.67, 33.33}) {
-                const int guideY = mapY(guide);
-                MoveToEx(dc, rect.left, guideY, nullptr);
-                LineTo(dc, rect.right, guideY);
-            }
-            SelectObject(dc, oldPen);
-            DeleteObject(guidePen);
-        }
-
-        if (history.empty()) {
-            return;
-        }
-        const int penWidth = (std::max)(1, static_cast<int>(std::lround(scale)));
-        HPEN linePen = CreatePen(PS_SOLID, penWidth, RGB(89, 211, 153));
-        oldPen = linePen == nullptr ? nullptr : SelectObject(dc, linePen);
-        if (linePen != nullptr) {
-            const std::size_t count = history.size();
-            for (std::size_t index = 0U; index < count; ++index) {
-                const int x = count <= 1U ? rect.right - 1 :
-                    rect.left + static_cast<int>((static_cast<unsigned long long>(index) *
-                    static_cast<unsigned long long>(graphWidth - 1)) /
-                    static_cast<unsigned long long>(count - 1U));
-                const int pointY = mapY(history[index]);
-                if (index == 0U) {
-                    MoveToEx(dc, x, pointY, nullptr);
-                } else {
-                    LineTo(dc, x, pointY);
-                }
-            }
-            SelectObject(dc, oldPen);
-            DeleteObject(linePen);
-        }
     }
 
     static NumericMetric ReadCpuUsage(ULARGE_INTEGER& previousIdle, ULARGE_INTEGER& previousKernel,
@@ -1306,7 +1179,7 @@ private:
 
         if (targetProcess != selectedFrameProcessId_) {
             selectedFrameProcessId_ = targetProcess;
-            // Never carry a previous target's five-second graph into a newly
+            // Never carry a previous target's stale intervals into a newly
             // selected stream. Keep only the new target's current rolling data.
             const auto selected = frameSamplesByProcess_.find(selectedFrameProcessId_);
             if (selected != frameSamplesByProcess_.end()) {
@@ -1323,7 +1196,6 @@ private:
         double sum = 0.0;
         std::size_t rollingCount = 0U;
         for (const FrameSample& sample : selected->second) {
-            snapshot.frameHistory.push_back(sample.milliseconds);
             if (sample.received >= rollingStart) {
                 sum += sample.milliseconds;
                 ++rollingCount;
@@ -1390,7 +1262,7 @@ private:
                 break;
             }
             // FPS capture has an application lifetime independent from F10.
-            // Hiding the window must never restart ETW or discard graph data.
+            // Hiding the window must never restart ETW or discard frame data.
             const SteadyClock::time_point now = SteadyClock::now();
             bool fpsCaptureEnabled = true;
             {
