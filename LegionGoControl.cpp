@@ -79,7 +79,6 @@ constexpr UINT_PTR FAN_TIMER_ID = 1;
 constexpr UINT ID_TRAY_SETTINGS = 40001;
 constexpr UINT ID_TRAY_PROFILES = 40002;
 constexpr UINT ID_TRAY_EXIT = 40005;
-constexpr UINT ID_TRAY_TDP = 40006;
 
 constexpr int IDC_TAB = 5000;
 constexpr int IDC_OK = 5001;
@@ -143,6 +142,7 @@ constexpr int IDC_OVERLAY_MARGIN_Y_SPIN = 5210;
 constexpr int IDC_OVERLAY_STATUS = 5211;
 constexpr int IDC_OVERLAY_STYLE = 5212;
 constexpr int IDC_OVERLAY_FPS_CAPTURE = 5213;
+constexpr int IDC_OVERLAY_DETAILED_SENSORS = 5214;
 constexpr int IDC_FPS_LIMIT_ENABLE = 5220;
 constexpr int IDC_FPS_LIMIT = 5221;
 constexpr int IDC_FPS_LIMIT_VALUE = 5222;
@@ -368,6 +368,7 @@ void CreateDefaultConfiguration() {
     IniWrite(L"FanProfiles", L"Order", L"");
     IniWriteInt(L"Overlay", L"VisibleAtStartup", 0);
     IniWriteInt(L"Overlay", L"FpsCaptureEnabled", 1);
+    IniWriteInt(L"Overlay", L"DetailedSensorsEnabled", 0);
     IniWriteInt(L"Overlay", L"FunctionKey", 10);
     IniWriteInt(L"Overlay", L"ScalePercent", 100);
     IniWriteInt(L"Overlay", L"OpacityPercent", 85);
@@ -902,6 +903,7 @@ void LoadConfiguration() {
     LegionGoOverlay::Config overlay;
     overlay.enabledAtStartup = IniInt(L"Overlay", L"VisibleAtStartup", 0) != 0;
     overlay.fpsCaptureEnabled = IniInt(L"Overlay", L"FpsCaptureEnabled", 1) != 0;
+    overlay.detailedSensorsEnabled = IniInt(L"Overlay", L"DetailedSensorsEnabled", 0) != 0;
     overlay.functionKey = (std::max)(1, (std::min)(24, IniInt(L"Overlay", L"FunctionKey", 10)));
     overlay.scalePercent = (std::max)(50, (std::min)(200, IniInt(L"Overlay", L"ScalePercent", 100)));
     overlay.opacityPercent = (std::max)(0, (std::min)(100, IniInt(L"Overlay", L"OpacityPercent", 85)));
@@ -1598,6 +1600,7 @@ void PopulateSettings(HWND hwnd) {
     RefreshFanProfileCombo(hwnd);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_ENABLE, BM_SETCHECK, LegionGoOverlay::IsVisible() ? BST_CHECKED : BST_UNCHECKED, 0);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_FPS_CAPTURE, BM_SETCHECK, state->overlay.fpsCaptureEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendDlgItemMessageW(hwnd, IDC_OVERLAY_DETAILED_SENSORS, BM_SETCHECK, state->overlay.detailedSensorsEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_HOTKEY, CB_SETCURSEL, state->overlay.functionKey - 1, 0);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_SETPOS, TRUE, state->overlay.scalePercent);
     SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_SETPOS, TRUE, state->overlay.opacityPercent);
@@ -1644,6 +1647,7 @@ bool ApplySettings(HWND hwnd) {
     LegionGoOverlay::Config overlay;
     overlay.enabledAtStartup = SendDlgItemMessageW(hwnd, IDC_OVERLAY_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
     overlay.fpsCaptureEnabled = SendDlgItemMessageW(hwnd, IDC_OVERLAY_FPS_CAPTURE, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    overlay.detailedSensorsEnabled = SendDlgItemMessageW(hwnd, IDC_OVERLAY_DETAILED_SENSORS, BM_GETCHECK, 0, 0) == BST_CHECKED;
     overlay.functionKey = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_HOTKEY, CB_GETCURSEL, 0, 0)) + 1;
     overlay.scalePercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_GETPOS, 0, 0));
     overlay.opacityPercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_GETPOS, 0, 0));
@@ -1681,6 +1685,7 @@ bool ApplySettings(HWND hwnd) {
     WriteFanProfilesToIni(state->fanProfiles, selectedFanProfileId);
     IniWriteInt(L"Overlay", L"VisibleAtStartup", overlay.enabledAtStartup ? 1 : 0);
     IniWriteInt(L"Overlay", L"FpsCaptureEnabled", overlay.fpsCaptureEnabled ? 1 : 0);
+    IniWriteInt(L"Overlay", L"DetailedSensorsEnabled", overlay.detailedSensorsEnabled ? 1 : 0);
     IniWriteInt(L"Overlay", L"FunctionKey", overlay.functionKey);
     IniWriteInt(L"Overlay", L"ScalePercent", overlay.scalePercent);
     IniWriteInt(L"Overlay", L"OpacityPercent", overlay.opacityPercent);
@@ -1809,7 +1814,9 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
                                    x + 120, y + 44, 130, 300, IDC_OVERLAY_HOTKEY);
     for (int key = 1; key <= 24; ++key) SendMessageW(overlayHotkey, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>((L"F" + std::to_wstring(key)).c_str()));
     PageField(state, 4, hwnd, L"BUTTON", L"Capture FPS (continuous ETW)", BS_AUTOCHECKBOX | WS_TABSTOP,
-              x + 330, y + 46, 330, 26, IDC_OVERLAY_FPS_CAPTURE);
+              x + 330, y + 46, 300, 26, IDC_OVERLAY_FPS_CAPTURE);
+    PageField(state, 4, hwnd, L"BUTTON", L"Detailed GPU/power counters", BS_AUTOCHECKBOX | WS_TABSTOP,
+              x + 630, y + 46, 250, 26, IDC_OVERLAY_DETAILED_SENSORS);
     Label(state, 4, hwnd, L"Scale:", x, y + 94, 110, 24);
     HWND overlayScale = PageField(state, 4, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
                                   x + 120, y + 86, 430, 40, IDC_OVERLAY_SCALE);
@@ -2280,7 +2287,6 @@ void ShowTrayMenu(HWND hwnd) {
     if (status.applyKnown && !status.applyOk) active += L" (apply failed)";
     AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, APP_VERSION);
     AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, active.c_str()); AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_TRAY_TDP, L"Open TDP setter");
     AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"Settings...");
     AppendMenuW(menu, MF_STRING, ID_TRAY_PROFILES, L"Game Profiles...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2290,8 +2296,7 @@ void ShowTrayMenu(HWND hwnd) {
     DestroyMenu(menu); PostMessageW(hwnd, WM_NULL, 0, 0); if (selected) PostMessageW(hwnd, WM_COMMAND, selected, 0);
 }
 void TrayCommand(UINT id) {
-    if (id == ID_TRAY_TDP) ShowSettings(2);
-    else if (id == ID_TRAY_SETTINGS) ShowSettings(0);
+    if (id == ID_TRAY_SETTINGS) ShowSettings(0);
     else if (id == ID_TRAY_PROFILES) ShowProfilesWindow();
     else if (id == ID_TRAY_EXIT) DestroyWindow(g_hidden);
 }

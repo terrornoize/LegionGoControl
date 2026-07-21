@@ -1252,6 +1252,8 @@ private:
         ULARGE_INTEGER previousUser{};
         bool havePreviousCpu = false;
         bool telemetryOpen = false;
+        bool pdhOpen = false;
+        bool detailedSensorsRequested = false;
         bool wasVisible = false;
         SteadyClock::time_point nextMetric = SteadyClock::now();
         SteadyClock::time_point nextPresentTraceStart = SteadyClock::now();
@@ -1265,9 +1267,11 @@ private:
             // Hiding the window must never restart ETW or discard frame data.
             const SteadyClock::time_point now = SteadyClock::now();
             bool fpsCaptureEnabled = true;
+            bool detailedSensorsEnabled = false;
             {
                 std::lock_guard<std::mutex> lock(configMutex_);
                 fpsCaptureEnabled = config_.fpsCaptureEnabled;
+                detailedSensorsEnabled = config_.detailedSensorsEnabled;
             }
             DWORD observedForegroundProcess = 0U;
             const HWND observedForegroundWindow = GetForegroundWindow();
@@ -1290,6 +1294,8 @@ private:
             if (!visible) {
                 if (wasVisible) {
                     pdh.Close();
+                    pdhOpen = false;
+                    detailedSensorsRequested = false;
                     dxgi.Close();
                     telemetryOpen = false;
                     havePreviousCpu = false;
@@ -1303,17 +1309,22 @@ private:
             }
 
             if (!wasVisible) {
-                pdh.Open();
                 dxgi.Open();
                 telemetryOpen = true;
+                detailedSensorsRequested = detailedSensorsEnabled;
+                pdhOpen = detailedSensorsEnabled && pdh.Open();
                 nextMetric = now;
                 wasVisible = true;
+            } else if (detailedSensorsEnabled != detailedSensorsRequested) {
+                pdh.Close();
+                detailedSensorsRequested = detailedSensorsEnabled;
+                pdhOpen = detailedSensorsEnabled && pdh.Open();
             }
 
             if (telemetryOpen && now >= nextMetric) {
                 Snapshot snapshot{};
                 snapshot.cpuPercent = ReadCpuUsage(previousIdle, previousKernel, previousUser, havePreviousCpu);
-                pdh.Collect(snapshot.gpuPercent, snapshot.vramUsedBytes, snapshot.powerWatts);
+                if (pdhOpen) pdh.Collect(snapshot.gpuPercent, snapshot.vramUsedBytes, snapshot.powerWatts);
                 dxgi.ReadCapacity(snapshot.vramCapacityBytes, snapshot.vramBudgetBytes);
                 ReadMemory(snapshot);
                 ReadBattery(snapshot);

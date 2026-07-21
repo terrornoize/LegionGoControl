@@ -28,7 +28,6 @@ Both executables must remain in the same directory. FPS/frame timing is collecte
 
 The V2.1 tray is intentionally small:
 
-- **Open TDP setter** — opens the TDP tab in Settings;
 - **Settings...** — opens General, Controller, TDP, Fan, Overlay and Info settings;
 - **Game Profiles...** — manages per-executable TDP profiles;
 - version header (`LegionGoControl v2.1 YYYYMMDD #abcde`) and active target status;
@@ -120,7 +119,7 @@ Metrics update once per second and are rendered in this fixed order:
 9. remaining battery percentage;
 10. local time in 24-hour format.
 
-When **Capture FPS (continuous ETW)** is enabled, FPS uses the original native collector from the first FPS release: one real-time `Microsoft-Windows-DXGI` / `Microsoft-Windows-D3D9` ETW session remains active for the application lifetime. Desktop/foreground transitions and F10 visibility toggles never stop or restart it; hiding the overlay preserves the rolling FPS samples. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. This intentionally restores the earlier behavior, including the possibility of seeing a dominant desktop graphics stream instead of suppressing FPS on Windows. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
+When **Capture FPS (continuous ETW)** is enabled, FPS uses the original native collector from the first FPS release: one real-time `Microsoft-Windows-DXGI` / `Microsoft-Windows-D3D9` ETW session remains active for the application lifetime. Desktop/foreground transitions and F10 visibility toggles never stop or restart it; hiding the overlay preserves the rolling FPS samples. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. This intentionally restores the earlier behavior, including the possibility of seeing a dominant desktop graphics stream instead of suppressing FPS on Windows. The low-impact default avoids PDH entirely: GPU utilization, VRAM used and CPU package power show `N/A`, while DXGI supplies only VRAM capacity/budget. **Detailed GPU/power counters** can opt back into Windows GPU Engine and AMD `Energy Meter (RAPL_Package0_PKG)\\Power` PDH polling, but may affect sensitive games. Memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
 
 Because the overlay deliberately avoids game injection, a protected game or true exclusive-fullscreen presentation may cover it. Borderless/windowed fullscreen is the most compatible mode.
 
