@@ -924,12 +924,16 @@ private:
             // Reserve exactly two rendered spaces after the FPS area. Shift
             // every following metric together; keep the clock right edge fixed.
             const int afterFpsShift = textWidth(L"  ");
-            segments[0].right = (std::min)(layoutWidth, segments[0].right + afterFpsShift);
+            const auto shiftedCoordinate = [layoutWidth, afterFpsShift](LONG coordinate) {
+                return static_cast<LONG>((std::min)(layoutWidth, static_cast<int>(coordinate) + afterFpsShift));
+            };
+            segments[0].right = shiftedCoordinate(segments[0].right);
             for (int index = 1; index <= 5; ++index) {
-                segments[index].left = (std::min)(layoutWidth, segments[index].left + afterFpsShift);
-                segments[index].right = (std::min)(layoutWidth, segments[index].right + afterFpsShift);
+                segments[index].left = shiftedCoordinate(segments[index].left);
+                segments[index].right = shiftedCoordinate(segments[index].right);
             }
-            segments[6].left = (std::min)(segments[6].right, segments[6].left + afterFpsShift);
+            segments[6].left = (std::min)(segments[6].right,
+                                          static_cast<LONG>(segments[6].left + afterFpsShift));
 
             const auto drawPair = [targetDc, gap, &textWidth, white](RECT rect, const wchar_t* label,
                                                                     COLORREF color,
