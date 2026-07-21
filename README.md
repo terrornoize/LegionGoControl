@@ -307,7 +307,7 @@ LegionGoNativeWmiProbe.exe
 build\LegionGoCoreTests.exe
 ```
 
-The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release, embeds the application icon and includes the Per-Monitor DPI-aware manifest. `build.bat` generates `build/LegionGoBuildVersion.h` from the checked-out Git commit date and five-character short hash; Info, the tray menu and the tray tooltip therefore identify the source revision automatically. Icon attribution is documented in `assets/README.md` and displayed in Settings > Info.
+The build uses C++17, UTF-8 source encoding, `/W4`, `/O2`, x64 Release, embeds the application icon and includes the Per-Monitor DPI-aware manifest. `build.bat` generates `build/LegionGoBuildVersion.h` from the checked-out Git commit date and five-character hash suffix; Info, the tray menu and the tray tooltip therefore identify the source revision automatically. Icon attribution is documented in `assets/README.md` and displayed in Settings > Info.
 
 ## Non-hardware tests
 

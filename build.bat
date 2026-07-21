@@ -9,11 +9,13 @@ if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%" || exit /b 1
 
 set "COMMIT_DATE=unknown-date"
 set "COMMIT_SHORT=local"
+set "COMMIT_FULL="
 where git >nul 2>nul
 if not errorlevel 1 (
     for /f "usebackq tokens=*" %%I in (`git -C "%CD%" log -1 --format^=%%cs 2^>nul`) do set "COMMIT_DATE=%%I"
-    for /f "usebackq tokens=*" %%I in (`git -C "%CD%" rev-parse --short^=5 HEAD 2^>nul`) do set "COMMIT_SHORT=%%I"
+    for /f "usebackq tokens=*" %%I in (`git -C "%CD%" rev-parse HEAD 2^>nul`) do set "COMMIT_FULL=%%I"
 )
+if defined COMMIT_FULL call set "COMMIT_SHORT=%%COMMIT_FULL:~-5%%"
 set "COMMIT_DATE=%COMMIT_DATE:-=%"
 > "%BUILD_DIR%\LegionGoBuildVersion.h" echo #pragma once
 >>"%BUILD_DIR%\LegionGoBuildVersion.h" echo #define LEGIONGO_COMMIT_DATE L"%COMMIT_DATE%"
