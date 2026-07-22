@@ -1,6 +1,6 @@
 # LegionGoControl V2.1 (beta)
 
-LegionGoControl is a native Windows tray utility for the **Lenovo Legion Go 1 / 8APU1 / Z1 Extreme**. V2.1 adds a graphical settings interface, per-executable TDP profiles, named firmware fan-curve profiles and an autonomous performance overlay while keeping the original Raw Input button mapper and Lenovo WMI backend.
+LegionGoControl is a native Windows tray utility for the **Lenovo Legion Go 1 / 8APU1 / Z1 Extreme**. V2.1 adds a graphical settings interface, per-executable TDP profiles and named firmware fan-curve profiles while keeping the original Raw Input button mapper and Lenovo WMI backend.
 
 > **Hardware beta:** fan telemetry, curve read/write/read-back and restore have been tested remotely on model `83E1 / Legion Go 8APU1`, BIOS `N3CN37WW`. Lenovo HID, TDP and battery behavior still require target-device validation before daily use, and other BIOS versions remain unverified.
 
@@ -11,7 +11,6 @@ LegionGoControl.exe
 ├─ tray and Settings UI
 ├─ Legion Go Raw Input mapper
 ├─ process monitor and Game Profiles resolver
-├─ click-through performance overlay and native metric collectors
 ├─ verified AMD Radeon Chill frame limiter with crash recovery
 └─ serialized calls to the Lenovo backend
 
@@ -22,16 +21,15 @@ LegionGoNativeWmiProbe.exe
 └─ verified battery-limit status/set/toggle
 ```
 
-Both executables must remain in the same directory. FPS/frame timing is collected directly by LegionGoControl through Windows ETW; no RTSS or separate collector is required.
+Both executables must remain in the same directory.
 
 ## Tray menu
 
 The V2.1 tray is intentionally small:
 
-- **Open TDP setter** — opens the TDP tab in Settings;
-- **Settings...** — opens General, Controller, TDP, Fan, Overlay and Info settings;
-- **Game Profiles...** — manages per-executable TDP profiles;
 - version header (`LegionGoControl v2.1 YYYYMMDD #abcde`) and active target status;
+- **Settings...** — opens General, Controller, TDP, Fan and Info settings;
+- **Game Profiles...** — manages per-executable TDP profiles;
 - **Exit**.
 
 Startup, battery limit and logging were moved from the tray into **Settings > General**.
@@ -101,29 +99,6 @@ Curve writes are explicit, validated, read back exactly and rolled back on failu
 
 Hardware observations on BIOS `N3CN37WW`: `28%` stabilized near `2100 RPM`; `84%` stabilized near `6280 RPM`; firmware ramps speed changes gradually rather than stepping immediately.
 
-### Overlay
-
-The Overlay tab configures an autonomous RTSS-style display. It is a normal topmost, no-activate, click-through Windows window: LegionGoControl does not inject DLLs or code into games and does not depend on RTSS. A configurable global `F1-F24` key toggles it. Scale (`50-200%`), black overlay opacity (`0-100%`, background and text fade together), screen corner and X/Y margins are configurable. Font size follows Windows DPI rather than the game's render resolution, so switching to 1280x800 fullscreen does not shrink it.
-
-Two layouts are available: the original vertical panel and a compact full-width top performance bar. The top bar follows the fixed colored labels `FPS`, `Z1E`, `780M`, `RAM`, `FAN`, `BATT`, followed by the 24-hour clock.
-
-Metrics update once per second and are rendered in this fixed order:
-
-1. FPS;
-2. CPU usage;
-3. CPU temperature;
-4. CPU package power;
-5. GPU usage;
-6. VRAM used / configured total;
-7. occupied RAM / total RAM;
-8. fan RPM;
-9. remaining battery percentage;
-10. local time in 24-hour format.
-
-When **Capture FPS (continuous ETW)** is enabled, FPS uses the original native collector from the first FPS release: one real-time `Microsoft-Windows-DXGI` / `Microsoft-Windows-D3D9` ETW session remains active for the application lifetime. Desktop/foreground transitions and F10 visibility toggles never stop or restart it; hiding the overlay preserves the rolling FPS samples. Frame streams are grouped by PID: the foreground presenter is preferred, with an automatic dominant-stream fallback for launchers and games whose rendering process owns no foreground window. This intentionally restores the earlier behavior, including the possibility of seeing a dominant desktop graphics stream instead of suppressing FPS on Windows. CPU package power uses the Windows/AMD `Energy Meter (RAPL_Package0_PKG)\\Power` counter and converts mW to W. GPU metrics use Windows GPU performance counters; memory, battery and time use Win32; CPU temperature and fan RPM use the verified Lenovo backend. Unavailable values are shown as `N/A` without hiding other rows.
-
-Because the overlay deliberately avoids game injection, a protected game or true exclusive-fullscreen presentation may cover it. Borderless/windowed fullscreen is the most compatible mode.
-
 ### FPS limiter
 
 Settings > General provides a base FPS limiter from `30` to `144 FPS`. Each Game Profile can optionally override that base target with its own `30-144 FPS` slider. The limiter uses the AMD driver-provided Radeon Chill interface in `amdadlx64.dll`, setting Chill minimum and maximum to the same target; it does not use RTSS, process suspension or game injection.
@@ -156,7 +131,7 @@ The process monitor scans approximately every 750 ms using `CreateToolhelp32Snap
 
 Automatic following requires LegionGoControl to observe the configured root executable at least once. No Windows API can reconstruct a launcher relationship that ended before LegionGoControl itself started.
 
-The active profile and latest backend result are shown in the tray tooltip, tray menu and Game Profiles list.
+The active profile and target are shown in the tray tooltip and tray menu. The Game Profiles list also shows runtime status.
 
 ## V1 INI compatibility
 
@@ -212,16 +187,6 @@ Order={fan-guid-1},{fan-guid-2}
 Name=Balanced
 Duty0=44
 ; ... Duty9
-
-[Overlay]
-VisibleAtStartup=0
-FunctionKey=10
-ScalePercent=100
-OpacityPercent=85
-Corner=1
-MarginX=20
-MarginY=20
-Style=1
 
 [General]
 FpsLimitEnabled=0
@@ -351,10 +316,8 @@ Before daily use, validate on the actual device:
 8. Suspend/resume, app restart and forced game termination do not leave an unwanted target active.
 9. Backend timeout/failure is shown as an error and does not claim success.
 10. Fan profiles survive restart and selecting each profile restores its ten saved points.
-11. The overlay hotkey toggles without focusing it; values refresh once per second and clicks pass through to the game.
-12. Compare FPS with another trusted counter and CPU/GPU/RAM values with Windows Task Manager during a controlled workload.
-13. Enable a harmless 60 FPS base limit, verify AMD Radeon Chill min/max read-back, disable it, and confirm the previous Radeon state is restored.
-14. Configure a different Game Profile FPS target and verify base/profile switching and final restore.
+11. Enable a harmless 60 FPS base limit, verify AMD Radeon Chill min/max read-back, disable it, and confirm the previous Radeon state is restored.
+12. Configure a different Game Profile FPS target and verify base/profile switching and final restore.
 
 ## Safety
 

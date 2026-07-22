@@ -20,7 +20,6 @@
 
 #include "LegionGoCore.h"
 #include "LegionGoFrameLimiter.h"
-#include "LegionGoOverlay.h"
 #include "resource.h"
 
 #if __has_include("build/LegionGoBuildVersion.h")
@@ -128,20 +127,6 @@ constexpr int IDC_FAN_PROFILE = 5098;
 constexpr int IDC_FAN_PROFILE_NEW = 5099;
 constexpr int IDC_FAN_PROFILE_SAVE = 5161;
 constexpr int IDC_FAN_PROFILE_DELETE = 5162;
-constexpr int IDC_OVERLAY_ENABLE = 5200;
-constexpr int IDC_OVERLAY_HOTKEY = 5201;
-constexpr int IDC_OVERLAY_SCALE = 5202;
-constexpr int IDC_OVERLAY_SCALE_VALUE = 5203;
-constexpr int IDC_OVERLAY_OPACITY = 5204;
-constexpr int IDC_OVERLAY_OPACITY_VALUE = 5205;
-constexpr int IDC_OVERLAY_CORNER = 5206;
-constexpr int IDC_OVERLAY_MARGIN_X = 5207;
-constexpr int IDC_OVERLAY_MARGIN_X_SPIN = 5208;
-constexpr int IDC_OVERLAY_MARGIN_Y = 5209;
-constexpr int IDC_OVERLAY_MARGIN_Y_SPIN = 5210;
-constexpr int IDC_OVERLAY_STATUS = 5211;
-constexpr int IDC_OVERLAY_STYLE = 5212;
-constexpr int IDC_OVERLAY_FPS_CAPTURE = 5213;
 constexpr int IDC_FPS_LIMIT_ENABLE = 5220;
 constexpr int IDC_FPS_LIMIT = 5221;
 constexpr int IDC_FPS_LIMIT_VALUE = 5222;
@@ -194,7 +179,6 @@ int g_actionCooldownMs = 250;
 LegionGoCore::TdpTriple g_baseTdp{16, 20, 20};
 bool g_fanEnabled = false;
 LegionGoCore::FanCurve g_fanCurve{{44,48,48,51,51,55,60,71,87,87}};
-LegionGoOverlay::Config g_overlayConfig{};
 bool g_baseFpsLimitEnabled = false;
 int g_baseFpsLimit = 60;
 bool g_fpsLimiterReady = true;
@@ -365,15 +349,6 @@ void CreateDefaultConfiguration() {
     for (int index = 0; index < 10; ++index)
         IniWriteInt(L"Fan", (L"Duty" + std::to_wstring(index)).c_str(), fanDefaults[index]);
     IniWrite(L"FanProfiles", L"Order", L"");
-    IniWriteInt(L"Overlay", L"VisibleAtStartup", 0);
-    IniWriteInt(L"Overlay", L"FpsCaptureEnabled", 1);
-    IniWriteInt(L"Overlay", L"FunctionKey", 10);
-    IniWriteInt(L"Overlay", L"ScalePercent", 100);
-    IniWriteInt(L"Overlay", L"OpacityPercent", 85);
-    IniWriteInt(L"Overlay", L"Corner", 1);
-    IniWriteInt(L"Overlay", L"MarginX", 20);
-    IniWriteInt(L"Overlay", L"MarginY", 20);
-    IniWriteInt(L"Overlay", L"Style", 0);
 
     struct DefaultButton { const wchar_t* name; int enabled; const wchar_t* action; const wchar_t* valueKey; const wchar_t* value; };
     const DefaultButton defaults[] = {
@@ -898,16 +873,6 @@ void LoadConfiguration() {
     if (selectedFan == fanProfiles.end()) selectedFan = fanProfiles.begin();
     selectedFanProfileId = selectedFan->id;
     fanCurve = selectedFan->curve;
-    LegionGoOverlay::Config overlay;
-    overlay.enabledAtStartup = IniInt(L"Overlay", L"VisibleAtStartup", 0) != 0;
-    overlay.fpsCaptureEnabled = IniInt(L"Overlay", L"FpsCaptureEnabled", 1) != 0;
-    overlay.functionKey = (std::max)(1, (std::min)(24, IniInt(L"Overlay", L"FunctionKey", 10)));
-    overlay.scalePercent = (std::max)(50, (std::min)(200, IniInt(L"Overlay", L"ScalePercent", 100)));
-    overlay.opacityPercent = (std::max)(0, (std::min)(100, IniInt(L"Overlay", L"OpacityPercent", 85)));
-    overlay.corner = (std::max)(0, (std::min)(3, IniInt(L"Overlay", L"Corner", 1)));
-    overlay.marginX = (std::max)(0, (std::min)(500, IniInt(L"Overlay", L"MarginX", 20)));
-    overlay.marginY = (std::max)(0, (std::min)(500, IniInt(L"Overlay", L"MarginY", 20)));
-    overlay.layoutStyle = (std::max)(0, (std::min)(1, IniInt(L"Overlay", L"Style", 0)));
     if (g_buttons.empty()) InitializeButtons();
     for (auto& button : g_buttons) {
         const bool pressed = button.pressed;
@@ -925,7 +890,6 @@ void LoadConfiguration() {
     g_fanEnabled = fanEnabled;
     g_fanProfiles = std::move(fanProfiles);
     g_selectedFanProfileId = std::move(selectedFanProfileId);
-    g_overlayConfig = overlay;
     g_baseFpsLimitEnabled = baseFpsLimitEnabled;
     g_baseFpsLimit = baseFpsLimit;
     g_profiles = profiles;
@@ -1309,7 +1273,7 @@ void CenterWindow(HWND window, HWND owner) {
     SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 }
 
-constexpr int SETTINGS_PAGE_COUNT = 6;
+constexpr int SETTINGS_PAGE_COUNT = 5;
 struct SettingsState {
     int tab = 0, selectedButton = 0, selectedFanPoint = 4;
     bool loading = false;
@@ -1323,7 +1287,6 @@ struct SettingsState {
     int selectedFanProfile = 0;
     LegionGoCore::TdpTriple base;
     LegionGoCore::FanCurve fanDraft{{44,48,48,51,51,55,60,71,87,87}};
-    LegionGoOverlay::Config overlay;
     std::vector<StoredFanProfile> fanProfiles;
     std::vector<ButtonBinding> buttons;
     std::vector<HWND> pages[SETTINGS_PAGE_COUNT];
@@ -1574,7 +1537,7 @@ void PopulateSettings(HWND hwnd) {
     { std::lock_guard<std::mutex> lock(g_configurationMutex);
       state->base = g_baseTdp; state->fanDraft = g_fanCurve; state->fanEnabled = g_fanEnabled;
       state->baseFpsEnabled = g_baseFpsLimitEnabled; state->baseFps = g_baseFpsLimit;
-      state->fanProfiles = g_fanProfiles; state->overlay = g_overlayConfig;
+      state->fanProfiles = g_fanProfiles;
       state->selectedFanProfile = 0;
       for (std::size_t index = 0; index < state->fanProfiles.size(); ++index)
           if (Upper(state->fanProfiles[index].id) == Upper(g_selectedFanProfileId)) state->selectedFanProfile = static_cast<int>(index);
@@ -1595,17 +1558,6 @@ void PopulateSettings(HWND hwnd) {
     SetNumericValue(hwnd, IDC_BASE_SLOW, IDC_BASE_SLOW_SPIN, state->base.slow);
     SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_SETCHECK, state->fanEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     RefreshFanProfileCombo(hwnd);
-    SendDlgItemMessageW(hwnd, IDC_OVERLAY_ENABLE, BM_SETCHECK, LegionGoOverlay::IsVisible() ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendDlgItemMessageW(hwnd, IDC_OVERLAY_FPS_CAPTURE, BM_SETCHECK, state->overlay.fpsCaptureEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendDlgItemMessageW(hwnd, IDC_OVERLAY_HOTKEY, CB_SETCURSEL, state->overlay.functionKey - 1, 0);
-    SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_SETPOS, TRUE, state->overlay.scalePercent);
-    SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_SETPOS, TRUE, state->overlay.opacityPercent);
-    SendDlgItemMessageW(hwnd, IDC_OVERLAY_CORNER, CB_SETCURSEL, state->overlay.corner, 0);
-    SendDlgItemMessageW(hwnd, IDC_OVERLAY_STYLE, CB_SETCURSEL, state->overlay.layoutStyle, 0);
-    SetNumericValue(hwnd, IDC_OVERLAY_MARGIN_X, IDC_OVERLAY_MARGIN_X_SPIN, state->overlay.marginX);
-    SetNumericValue(hwnd, IDC_OVERLAY_MARGIN_Y, IDC_OVERLAY_MARGIN_Y_SPIN, state->overlay.marginY);
-    SetText(hwnd, IDC_OVERLAY_SCALE_VALUE, std::to_wstring(state->overlay.scalePercent) + L"%");
-    SetText(hwnd, IDC_OVERLAY_OPACITY_VALUE, std::to_wstring(state->overlay.opacityPercent) + L"%");
     UpdateFanPointEditor(hwnd); InvalidateRect(GetDlgItem(hwnd, IDC_FAN_CURVE), nullptr, FALSE);
     state->loading = false; LoadControllerEditor(hwnd);
 }
@@ -1640,31 +1592,8 @@ bool ApplySettings(HWND hwnd) {
     if (!LegionGoCore::ValidateFanCurve(state->fanDraft, &error)) { Message(hwnd, L"Fan curve", error, MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 3); return false; }
     if (!SaveCurrentFanProfile(hwnd)) { ShowSettingsPage(hwnd, 3); return false; }
     const bool fanEnabled = SendDlgItemMessageW(hwnd, IDC_FAN_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    LegionGoOverlay::Config overlay;
-    overlay.enabledAtStartup = SendDlgItemMessageW(hwnd, IDC_OVERLAY_ENABLE, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    overlay.fpsCaptureEnabled = SendDlgItemMessageW(hwnd, IDC_OVERLAY_FPS_CAPTURE, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    overlay.functionKey = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_HOTKEY, CB_GETCURSEL, 0, 0)) + 1;
-    overlay.scalePercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_GETPOS, 0, 0));
-    overlay.opacityPercent = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_GETPOS, 0, 0));
-    overlay.corner = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_CORNER, CB_GETCURSEL, 0, 0));
-    overlay.layoutStyle = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_STYLE, CB_GETCURSEL, 0, 0));
-    if (!ParseInteger(hwnd, IDC_OVERLAY_MARGIN_X, overlay.marginX) || !ParseInteger(hwnd, IDC_OVERLAY_MARGIN_Y, overlay.marginY) ||
-        overlay.marginX < 0 || overlay.marginX > 500 || overlay.marginY < 0 || overlay.marginY > 500) {
-        Message(hwnd, L"Overlay", L"Overlay margins must be between 0 and 500.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 4); return false;
-    }
-    if (overlay.functionKey < 1 || overlay.functionKey > 24 || overlay.scalePercent < 50 || overlay.scalePercent > 200 ||
-        overlay.opacityPercent < 0 || overlay.opacityPercent > 100 || overlay.corner < 0 || overlay.corner > 3 ||
-        overlay.layoutStyle < 0 || overlay.layoutStyle > 1) {
-        Message(hwnd, L"Overlay", L"Overlay settings are invalid.", MB_OK | MB_ICONERROR); ShowSettingsPage(hwnd, 4); return false;
-    }
     const bool logging = SendDlgItemMessageW(hwnd, IDC_LOGGING, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const bool startup = SendDlgItemMessageW(hwnd, IDC_STARTUP, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    LegionGoOverlay::ApplyConfig(overlay);
-    if (LegionGoOverlay::ActiveFunctionKey() != overlay.functionKey) {
-        LegionGoOverlay::ApplyConfig(state->overlay);
-        Message(hwnd, L"Overlay", L"That function key is already in use. Choose another key.", MB_OK | MB_ICONERROR);
-        ShowSettingsPage(hwnd, 4); return false;
-    }
     if (startup != state->startup && !SetStartupEnabled(startup)) {
         Message(hwnd, L"Settings", L"The Windows scheduled task could not be changed.", MB_OK | MB_ICONERROR); return false;
     }
@@ -1678,14 +1607,6 @@ bool ApplySettings(HWND hwnd) {
         IniWriteInt(L"Fan", (L"Duty" + std::to_wstring(index)).c_str(), state->fanDraft.dutyPercent[index]);
     const std::wstring selectedFanProfileId = state->fanProfiles[static_cast<std::size_t>(state->selectedFanProfile)].id;
     WriteFanProfilesToIni(state->fanProfiles, selectedFanProfileId);
-    IniWriteInt(L"Overlay", L"VisibleAtStartup", overlay.enabledAtStartup ? 1 : 0);
-    IniWriteInt(L"Overlay", L"FpsCaptureEnabled", overlay.fpsCaptureEnabled ? 1 : 0);
-    IniWriteInt(L"Overlay", L"FunctionKey", overlay.functionKey);
-    IniWriteInt(L"Overlay", L"ScalePercent", overlay.scalePercent);
-    IniWriteInt(L"Overlay", L"OpacityPercent", overlay.opacityPercent);
-    IniWriteInt(L"Overlay", L"Corner", overlay.corner);
-    IniWriteInt(L"Overlay", L"MarginX", overlay.marginX); IniWriteInt(L"Overlay", L"MarginY", overlay.marginY);
-    IniWriteInt(L"Overlay", L"Style", overlay.layoutStyle);
     for (const auto& button : state->buttons) {
         IniWriteInt(button.name.c_str(), L"enabled", button.enabled ? 1 : 0);
         IniWrite(button.name.c_str(), L"trigger", button.triggerDown ? L"down" : L"up");
@@ -1696,8 +1617,8 @@ bool ApplySettings(HWND hwnd) {
     }
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_iniPath.c_str());
     state->startup = startup; state->base = base; state->debounce = debounce; state->cooldown = cooldown;
-    state->baseFpsEnabled = baseFpsEnabled; state->baseFps = baseFps; state->overlay = overlay;
-    LoadConfiguration(); LegionGoOverlay::SetVisible(overlay.enabledAtStartup);
+    state->baseFpsEnabled = baseFpsEnabled; state->baseFps = baseFps;
+    LoadConfiguration();
     QueueWorker(fanEnabled ? WorkerJob::FanApply : WorkerJob::FanRestore);
     QueueWorker(WorkerJob::Wake); Balloon(L"Settings applied."); return true;
 }
@@ -1705,10 +1626,10 @@ bool ApplySettings(HWND hwnd) {
 void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     HWND tab = Control(hwnd, WC_TABCONTROLW, L"", WS_TABSTOP | TCS_FIXEDWIDTH | TCS_OWNERDRAWFIXED, 12, 12, 876, 548, IDC_TAB);
     TCITEMW item{}; item.mask = TCIF_TEXT;
-    wchar_t general[] = L"General", controller[] = L"Controller", tdp[] = L"TDP", fan[] = L"Fan", overlay[] = L"Overlay", info[] = L"Info";
+    wchar_t general[] = L"General", controller[] = L"Controller", tdp[] = L"TDP", fan[] = L"Fan", info[] = L"Info";
     item.pszText = general; TabCtrl_InsertItem(tab, 0, &item); item.pszText = controller; TabCtrl_InsertItem(tab, 1, &item);
     item.pszText = tdp; TabCtrl_InsertItem(tab, 2, &item); item.pszText = fan; TabCtrl_InsertItem(tab, 3, &item);
-    item.pszText = overlay; TabCtrl_InsertItem(tab, 4, &item); item.pszText = info; TabCtrl_InsertItem(tab, 5, &item);
+    item.pszText = info; TabCtrl_InsertItem(tab, 4, &item);
     TabCtrl_SetItemSize(tab, DpiScale(hwnd, 130), DpiScale(hwnd, 32));
     Control(hwnd, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 638, 578, 76, 32, IDC_OK);
     Control(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 722, 578, 76, 32, IDC_CANCEL);
@@ -1796,56 +1717,19 @@ void CreateSettingsControls(HWND hwnd, SettingsState& state) {
     PageField(state, 3, hwnd, L"BUTTON", L"Restore firmware curve", BS_PUSHBUTTON | WS_TABSTOP, x + 675, y + 402, 150, 32, IDC_FAN_RESTORE);
     Label(state, 3, hwnd, L"Safety floors: 80 C >= 60%, 90 C >= 80%, 100 C >= 85%. Firmware emergency protection always has priority.", x, y + 452, 800, 30);
 
-    PageField(state, 4, hwnd, L"BUTTON", L"Show overlay now and at startup", BS_AUTOCHECKBOX | WS_TABSTOP,
-              x, y, 300, 26, IDC_OVERLAY_ENABLE);
-    Label(state, 4, hwnd, L"Style:", x + 330, y + 3, 60, 24);
-    HWND overlayStyle = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
-                                  x + 390, y, 190, 120, IDC_OVERLAY_STYLE);
-    SendMessageW(overlayStyle, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Vertical panel"));
-    SendMessageW(overlayStyle, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top performance bar"));
-    Label(state, 4, hwnd, L"Toggle key:", x, y + 48, 110, 24);
-    HWND overlayHotkey = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
-                                   x + 120, y + 44, 130, 300, IDC_OVERLAY_HOTKEY);
-    for (int key = 1; key <= 24; ++key) SendMessageW(overlayHotkey, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>((L"F" + std::to_wstring(key)).c_str()));
-    PageField(state, 4, hwnd, L"BUTTON", L"Capture FPS (continuous ETW)", BS_AUTOCHECKBOX | WS_TABSTOP,
-              x + 330, y + 46, 330, 26, IDC_OVERLAY_FPS_CAPTURE);
-    Label(state, 4, hwnd, L"Scale:", x, y + 94, 110, 24);
-    HWND overlayScale = PageField(state, 4, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
-                                  x + 120, y + 86, 430, 40, IDC_OVERLAY_SCALE);
-    SendMessageW(overlayScale, TBM_SETRANGE, TRUE, MAKELONG(50, 200)); SendMessageW(overlayScale, TBM_SETTICFREQ, 25, 0);
-    PageField(state, 4, hwnd, L"STATIC", L"100%", SS_LEFT, x + 570, y + 94, 100, 24, IDC_OVERLAY_SCALE_VALUE);
-    Label(state, 4, hwnd, L"Black opacity (text follows):", x, y + 140, 230, 24);
-    HWND overlayOpacity = PageField(state, 4, hwnd, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
-                                    x + 235, y + 132, 315, 40, IDC_OVERLAY_OPACITY);
-    SendMessageW(overlayOpacity, TBM_SETRANGE, TRUE, MAKELONG(0, 100)); SendMessageW(overlayOpacity, TBM_SETTICFREQ, 10, 0);
-    PageField(state, 4, hwnd, L"STATIC", L"85%", SS_LEFT, x + 570, y + 140, 100, 24, IDC_OVERLAY_OPACITY_VALUE);
-    Label(state, 4, hwnd, L"Corner:", x, y + 188, 110, 24);
-    HWND overlayCorner = PageField(state, 4, hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
-                                   x + 120, y + 184, 190, 180, IDC_OVERLAY_CORNER);
-    for (const wchar_t* corner : {L"Top left", L"Top right", L"Bottom left", L"Bottom right"}) SendMessageW(overlayCorner, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(corner));
-    Label(state, 4, hwnd, L"X margin:", x, y + 236, 110, 24);
-    HWND marginX = PageField(state, 4, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 120, y + 232, 70, 27, IDC_OVERLAY_MARGIN_X, WS_EX_CLIENTEDGE);
-    HWND marginXSpin = PageField(state, 4, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 192, y + 232, 22, 27, IDC_OVERLAY_MARGIN_X_SPIN); ConfigureSpinner(marginXSpin, marginX, 0, 500);
-    Label(state, 4, hwnd, L"Y margin:", x + 260, y + 236, 110, 24);
-    HWND marginY = PageField(state, 4, hwnd, L"EDIT", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, x + 370, y + 232, 70, 27, IDC_OVERLAY_MARGIN_Y, WS_EX_CLIENTEDGE);
-    HWND marginYSpin = PageField(state, 4, hwnd, UPDOWN_CLASSW, L"", UDS_ARROWKEYS | UDS_SETBUDDYINT, x + 442, y + 232, 22, 27, IDC_OVERLAY_MARGIN_Y_SPIN); ConfigureSpinner(marginYSpin, marginY, 0, 500);
-    Label(state, 4, hwnd, L"The overlay is topmost and click-through. FPS capture stays continuous when F10 hides or shows the window.", x, y + 300, 800, 48);
-    Label(state, 4, hwnd, L"Some protected or exclusive-fullscreen games may hide a normal Windows overlay. Unavailable sensors are shown as N/A.", x, y + 360, 800, 40);
-    PageField(state, 4, hwnd, L"STATIC", L"Updates once per second. Hotkey changes take effect after Apply.", SS_LEFT, x, y + 425, 800, 28, IDC_OVERLAY_STATUS);
-
-    Label(state, 5, hwnd, APP_VERSION, x, y, 760, 30);
-    Label(state, 5, hwnd,
-          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, custom fan curves, an AMD Radeon Chill limiter, performance overlay, and automatically applies per-application TDP profiles while following launcher child processes.",
+    Label(state, 4, hwnd, APP_VERSION, x, y, 760, 30);
+    Label(state, 4, hwnd,
+          L"LegionGoControl is a lightweight native Windows tray utility for Lenovo Legion Go. It maps extra controller buttons, manages Lenovo battery charge limiting, provides manual TDP controls, custom fan curves, an AMD Radeon Chill limiter, and automatically applies per-application TDP profiles while following launcher child processes.",
           x, y + 48, 790, 100);
-    Label(state, 5, hwnd, L"Repository:", x, y + 175, 120, 24);
-    PageField(state, 5, hwnd, L"BUTTON", L"Open GitHub repository", BS_PUSHBUTTON | WS_TABSTOP,
+    Label(state, 4, hwnd, L"Repository:", x, y + 175, 120, 24);
+    PageField(state, 4, hwnd, L"BUTTON", L"Open GitHub repository", BS_PUSHBUTTON | WS_TABSTOP,
               x, y + 205, 210, 34, IDC_INFO_REPOSITORY);
-    Label(state, 5, hwnd, REPOSITORY_URL, x + 230, y + 212, 540, 24);
-    Label(state, 5, hwnd, L"Application icon: Nintendo Switch by Nick Taras from The Noun Project (Creative Commons, attribution required).", x, y + 270, 790, 45);
-    PageField(state, 5, hwnd, L"BUTTON", L"Open icon and license page", BS_PUSHBUTTON | WS_TABSTOP,
+    Label(state, 4, hwnd, REPOSITORY_URL, x + 230, y + 212, 540, 24);
+    Label(state, 4, hwnd, L"Application icon: Nintendo Switch by Nick Taras from The Noun Project (Creative Commons, attribution required).", x, y + 270, 790, 45);
+    PageField(state, 4, hwnd, L"BUTTON", L"Open icon and license page", BS_PUSHBUTTON | WS_TABSTOP,
               x, y + 320, 230, 34, IDC_INFO_ICON_LICENSE);
-    Label(state, 5, hwnd,
-          L"This beta is hardware-specific. TDP, battery, HID, fan, overlay and restore behavior must be validated on the actual Legion Go device.",
+    Label(state, 4, hwnd,
+          L"This beta is hardware-specific. TDP, battery, HID, fan and restore behavior must be validated on the actual Legion Go device.",
           x, y + 390, 790, 55);
     ShowSettingsPage(hwnd, 0);
 }
@@ -1896,14 +1780,6 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             if (state && reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_FPS_LIMIT)) {
                 const int value = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_FPS_LIMIT, TBM_GETPOS, 0, 0));
                 SetText(hwnd, IDC_FPS_LIMIT_VALUE, std::to_wstring(value) + L" FPS"); return 0;
-            }
-            if (state && reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_OVERLAY_SCALE)) {
-                const int value = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_SCALE, TBM_GETPOS, 0, 0));
-                SetText(hwnd, IDC_OVERLAY_SCALE_VALUE, std::to_wstring(value) + L"%"); return 0;
-            }
-            if (state && reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_OVERLAY_OPACITY)) {
-                const int value = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_OVERLAY_OPACITY, TBM_GETPOS, 0, 0));
-                SetText(hwnd, IDC_OVERLAY_OPACITY_VALUE, std::to_wstring(value) + L"%"); return 0;
             }
             return DefWindowProcW(hwnd, message, wParam, lParam);
         }
@@ -2023,13 +1899,6 @@ void UpdateSettingsRuntime() {
         SetText(g_settings, IDC_FAN_STATUS, L"CPU " + std::to_wstring(status.fan.temperatureC) + L" C  |  Fan " +
             std::to_wstring(status.fan.rpm) + L" RPM  |  Curve command ~" + std::to_wstring(command) + L"%");
     } else SetText(g_settings, IDC_FAN_STATUS, status.fan.error.empty() ? L"Fan telemetry unavailable" : status.fan.error);
-    if (settings) {
-        const int activeKey = LegionGoOverlay::ActiveFunctionKey();
-        SetText(g_settings, IDC_OVERLAY_STATUS, activeKey > 0
-            ? std::wstring(L"Updates once per second. Toggle: F") + std::to_wstring(activeKey) +
-              (LegionGoOverlay::IsVisible() ? L". Overlay is active." : L". Overlay is hidden.")
-            : L"The selected function key is already in use. Choose another key and press Apply.");
-    }
     InvalidateRect(GetDlgItem(g_settings, IDC_FAN_CURVE), nullptr, FALSE);
 }
 void ShowSettings(int tab) {
@@ -2309,28 +2178,22 @@ LRESULT CALLBACK HiddenProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case WMAPP_TRAY: { const UINT event = LOWORD(lParam); if (TrayMouseEvent(event) || TrayMouseEvent(static_cast<UINT>(lParam))) ShowTrayMenu(hwnd); return 0; }
         case WMAPP_SHOW_SETTINGS: ShowSettings(static_cast<int>(wParam)); return 0;
         case WM_TIMER:
-            if (wParam == FAN_TIMER_ID) {
-                bool needTelemetry = LegionGoOverlay::IsVisible();
-                if (g_settings && IsWindowVisible(g_settings) && !IsIconic(g_settings)) {
-                    SettingsState* settings = SettingsData(g_settings);
-                    needTelemetry = needTelemetry || (settings && settings->tab == 3);
-                }
-                if (needTelemetry) QueueWorker(WorkerJob::FanStatus);
+            if (wParam == FAN_TIMER_ID && g_settings && IsWindowVisible(g_settings) && !IsIconic(g_settings)) {
+                SettingsState* settings = SettingsData(g_settings);
+                if (settings && settings->tab == 3) QueueWorker(WorkerJob::FanStatus);
             }
             return 0;
         case WMAPP_WORKER_UPDATE: {
-            const RuntimeStatus status = RuntimeSnapshot();
-            LegionGoOverlay::SetFirmwareTelemetry(status.fan.temperatureC, status.fan.rpm, status.fan.known);
             UpdateTrayTip(); UpdateSettingsRuntime();
             if (g_profilesWindow && IsWindowVisible(g_profilesWindow)) FillProfileList(g_profilesWindow);
             return 0;
         }
         case WM_QUERYENDSESSION: return TRUE;
         case WM_ENDSESSION:
-            if (wParam) { LegionGoOverlay::Shutdown(); StopWorker(); }
+            if (wParam) StopWorker();
             return 0;
         case WM_DESTROY:
-            KillTimer(hwnd, FAN_TIMER_ID); LegionGoOverlay::Shutdown(); StopWorker();
+            KillTimer(hwnd, FAN_TIMER_ID); StopWorker();
             if (g_settings && IsWindow(g_settings)) DestroyWindow(g_settings);
             if (g_profilesWindow && IsWindow(g_profilesWindow)) DestroyWindow(g_profilesWindow);
             Shell_NotifyIconW(NIM_DELETE, &g_nid); PostQuitMessage(0); return 0;
@@ -2385,10 +2248,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     if (!RestoreFpsBackup(fpsRecoveryError)) {
         g_fpsLimiterReady = false; LogAlways(L"FPS limiter crash recovery failed: " + fpsRecoveryError);
     }
-    if (!LegionGoOverlay::Initialize(instance, g_baseDir, g_overlayConfig))
-        LogAlways(L"Overlay initialization failed (window unavailable).");
-    else if (LegionGoOverlay::ActiveFunctionKey() == 0)
-        LogAlways(L"Overlay started, but F" + std::to_wstring(g_overlayConfig.functionKey) + L" is already registered by another application.");
     StartWorker();
     ShowWindow(g_hidden, SW_HIDE);
     MSG message{};
@@ -2399,7 +2258,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    LegionGoOverlay::Shutdown(); StopWorker();
+    StopWorker();
     if (getMessageResult < 0) LogAlways(L"GetMessage failed: " + std::to_wstring(GetLastError()));
     if (g_icon) DestroyIcon(g_icon); if (g_windowIcon) DestroyIcon(g_windowIcon); if (g_font) DeleteObject(g_font);
     if (g_singleton) { ReleaseMutex(g_singleton); CloseHandle(g_singleton); }
