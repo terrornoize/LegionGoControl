@@ -204,7 +204,21 @@ int InterpolateFanDuty(const FanCurve& curve, int temperatureC) noexcept {
 }
 
 int EstimateFanRpm(int dutyPercent) noexcept {
-    return (std::max)(0, (std::min)(100, dutyPercent)) * 75;
+    // Legion Go 8APU1 / N3CN37WW hardware calibration, measured at every
+    // five duty points and rounded to the nearest 25 RPM (2026-07-22).
+    constexpr std::array<int, 17> rpmAtFivePercentSteps{
+        1575, 1825, 2200, 2575, 2950, 3325, 3725, 4075, 4450,
+        4825, 5225, 5575, 5950, 6350, 6675, 7100, 7450
+    };
+    const int duty = (std::max)(0, (std::min)(100, dutyPercent));
+    if (duty <= 20) return (rpmAtFivePercentSteps.front() * duty + 10) / 20;
+    const int offset = duty - 20;
+    const std::size_t lowIndex = static_cast<std::size_t>(offset / 5);
+    if (lowIndex >= rpmAtFivePercentSteps.size() - 1U) return rpmAtFivePercentSteps.back();
+    const int remainder = offset % 5;
+    const int low = rpmAtFivePercentSteps[lowIndex];
+    const int high = rpmAtFivePercentSteps[lowIndex + 1U];
+    return low + ((high - low) * remainder + 2) / 5;
 }
 
 std::wstring NormalizeWindowsPath(const std::wstring& originalPath) {

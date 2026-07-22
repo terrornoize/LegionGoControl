@@ -73,8 +73,11 @@ void TestFanCurve() {
     CHECK(InterpolateFanDuty(baseline, 45) == 51);
     CHECK(InterpolateFanDuty(baseline, 65) == 58);
     CHECK(InterpolateFanDuty(baseline, 105) == 87);
-    CHECK(EstimateFanRpm(28) == 2100);
-    CHECK(EstimateFanRpm(84) == 6300);
+    CHECK(EstimateFanRpm(20) == 1575);
+    CHECK(EstimateFanRpm(28) == 2050);
+    CHECK(EstimateFanRpm(52) == 3865);
+    CHECK(EstimateFanRpm(84) == 6270);
+    CHECK(EstimateFanRpm(100) == 7450);
 }
 
 void TestPathNormalization() {

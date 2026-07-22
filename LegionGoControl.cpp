@@ -79,7 +79,6 @@ constexpr UINT_PTR FAN_TIMER_ID = 1;
 constexpr UINT ID_TRAY_SETTINGS = 40001;
 constexpr UINT ID_TRAY_PROFILES = 40002;
 constexpr UINT ID_TRAY_EXIT = 40005;
-constexpr UINT ID_TRAY_TDP = 40006;
 
 constexpr int IDC_TAB = 5000;
 constexpr int IDC_OK = 5001;
@@ -2280,7 +2279,6 @@ void ShowTrayMenu(HWND hwnd) {
     if (status.applyKnown && !status.applyOk) active += L" (apply failed)";
     AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, APP_VERSION);
     AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, active.c_str()); AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_TRAY_TDP, L"Open TDP setter");
     AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"Settings...");
     AppendMenuW(menu, MF_STRING, ID_TRAY_PROFILES, L"Game Profiles...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2290,8 +2288,7 @@ void ShowTrayMenu(HWND hwnd) {
     DestroyMenu(menu); PostMessageW(hwnd, WM_NULL, 0, 0); if (selected) PostMessageW(hwnd, WM_COMMAND, selected, 0);
 }
 void TrayCommand(UINT id) {
-    if (id == ID_TRAY_TDP) ShowSettings(2);
-    else if (id == ID_TRAY_SETTINGS) ShowSettings(0);
+    if (id == ID_TRAY_SETTINGS) ShowSettings(0);
     else if (id == ID_TRAY_PROFILES) ShowProfilesWindow();
     else if (id == ID_TRAY_EXIT) DestroyWindow(g_hidden);
 }
