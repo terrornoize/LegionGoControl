@@ -1,8 +1,6 @@
 #include "LegionGoOverlay.h"
 #include "LegionGoPresentTrace.h"
 
-#include <d3d11.h>
-#include <dcomp.h>
 #include <dxgi1_4.h>
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -12,7 +10,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <cwchar>
 #include <deque>
 #include <iomanip>
@@ -23,8 +20,6 @@
 #include <utility>
 #include <vector>
 
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dcomp.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "pdh.lib")
@@ -357,20 +352,13 @@ public:
             return false;
         }
 
-        // DirectComposition requires a non-redirected top-level window.  Keep
-        // the old layered path available below for systems where any part of
-        // the experimental D3D/DXGI/DComp setup is unavailable.
-        const DWORD extendedStyle = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+        const DWORD extendedStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
                                     WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
         window_ = CreateWindowExW(extendedStyle, kWindowClass, L"Legion Go Telemetry", WS_POPUP,
                                   0, 0, 1, 1, nullptr, nullptr, instance_, this);
         if (window_ == nullptr) {
             CleanupInitialization();
             return false;
-        }
-        compositionActive_ = InitializeCompositionBackend();
-        if (!compositionActive_) {
-            EnableLayeredFallback();
         }
 
         Config initialConfig{};
@@ -388,12 +376,9 @@ public:
             std::lock_guard<std::mutex> snapshotLock(snapshotMutex_);
             snapshot_ = {};
         }
-        // Configure the backend while hidden, then publish exactly one frame
-        // if startup visibility is enabled.
-        visible_.store(false);
+        visible_.store(initialConfig.enabledAtStartup);
         initialized_.store(true);
         ApplyWindowConfig();
-        visible_.store(initialConfig.enabledAtStartup);
         UpdateWindowVisibility();
 
         try {
@@ -536,10 +521,9 @@ private:
             }
             return 0;
         case kMessageRefresh:
-            refreshMessagePending_.store(false);
             if (visible_.load()) {
                 UpdateWindowLayout();
-                RequestFrame();
+                InvalidateRect(window, nullptr, FALSE);
             }
             return 0;
         case kMessageVisibility:
@@ -552,20 +536,17 @@ private:
             DestroyOverlayWindow();
             return 0;
         case WM_DISPLAYCHANGE:
+            UpdateWindowLayout();
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
         case WM_DPICHANGED:
             UpdateWindowLayout();
-            RequestFrame();
+            InvalidateRect(window, nullptr, FALSE);
             return 0;
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
-            if (compositionActive_) {
-                PAINTSTRUCT paint{};
-                BeginPaint(window, &paint);
-                EndPaint(window, &paint);
-            } else {
-                Paint(window);
-            }
+            Paint(window);
             return 0;
         case WM_CLOSE:
             SetModuleVisible(false);
@@ -587,7 +568,6 @@ private:
     }
 
     void CleanupInitialization() {
-        ReleaseCompositionBackend();
         if (hotKeyRegistered_ && window_ != nullptr) {
             UnregisterHotKey(window_, activeHotKeyId_);
             hotKeyRegistered_ = false;
@@ -613,7 +593,6 @@ private:
         activeFunctionKey_ = 0;
         activeHotKeyId_ = kHotKeyIdA;
         foregroundProcessId_.store(0U);
-        refreshMessagePending_.store(false);
         {
             std::lock_guard<std::mutex> firmwareLock(firmwareMutex_);
             firmwareTemperatureC_ = 0;
@@ -632,7 +611,6 @@ private:
             UnregisterHotKey(window_, activeHotKeyId_);
             hotKeyRegistered_ = false;
         }
-        ReleaseCompositionBackend();
         const HWND oldWindow = window_;
         window_ = nullptr;
         DestroyWindow(oldWindow);
@@ -662,23 +640,13 @@ private:
             }
         }
 
-        if (compositionActive_) {
-            if (compositionVisual3_ != nullptr) {
-                // Opaque mode intentionally ignores the configured visual
-                // opacity: visual alpha makes FC25 fall back to DWM composition.
-                const HRESULT opacityResult = compositionVisual3_->SetOpacity(1.0f);
-                if (FAILED(opacityResult) || compositionDevice_ == nullptr ||
-                    FAILED(compositionDevice_->Commit())) {
-                    EnableLayeredFallback();
-                }
-            }
-        } else {
-            // Preserve the original whole-window alpha behavior in fallback.
-            const BYTE alpha = static_cast<BYTE>((config.opacityPercent * 255 + 50) / 100);
-            SetLayeredWindowAttributes(window_, 0U, alpha, LWA_ALPHA);
-        }
+        // Opacity is intentionally applied to the complete black overlay:
+        // 0% is fully transparent and 100% is opaque black with opaque text.
+        // Intermediate values fade the background and lettering together.
+        const BYTE alpha = static_cast<BYTE>((config.opacityPercent * 255 + 50) / 100);
+        SetLayeredWindowAttributes(window_, 0U, alpha, LWA_ALPHA);
         UpdateWindowLayout();
-        RequestFrame();
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     void UpdateWindowVisibility() {
@@ -690,7 +658,7 @@ private:
             SetWindowPos(window_, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
             ShowWindow(window_, SW_SHOWNOACTIVATE);
-            RequestFrame();
+            InvalidateRect(window_, nullptr, FALSE);
         } else {
             ShowWindow(window_, SW_HIDE);
         }
@@ -785,15 +753,13 @@ private:
         int x = monitorLeft;
         int y = monitorTop;
         if (config.layoutStyle == 1) {
-            // The composition top bar is deliberately compact: a centered
-            // physical-pixel surface avoids a full-screen transparent swap
-            // chain while retaining all seven telemetry groups.
-            width = compositionActive_ ? (std::min)(900, monitorWidth) : monitorWidth;
-            const double fitScale = static_cast<double>(width) / 1120.0;
-            const double barTextScale = (std::min)(scale, (std::max)(0.65, fitScale));
+            width = monitorWidth;
+            const bool lowResolution = width < 1600;
+            const double fitScale = lowResolution ? 1.60 : static_cast<double>(width) / 1120.0;
+            const double barTextScale = (std::min)(scale, (std::max)(0.75, fitScale));
             height = static_cast<int>(std::lround(31.0 * barTextScale));
             height = (std::max)(1, (std::min)(monitorHeight, height));
-            x = compositionActive_ ? monitorLeft + ((monitorWidth - width) / 2) : monitorLeft;
+            x = monitorLeft;
             y = monitorTop;
         } else {
             width = static_cast<int>(std::lround(360.0 * scale));
@@ -814,260 +780,6 @@ private:
         }
 
         SetWindowPos(window_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
-    }
-
-    void ReleaseCompositionDib() {
-        if (compositionMemoryDc_ != nullptr) {
-            if (compositionOldBitmap_ != nullptr) {
-                SelectObject(compositionMemoryDc_, compositionOldBitmap_);
-            }
-            DeleteDC(compositionMemoryDc_);
-        }
-        if (compositionBitmap_ != nullptr) {
-            DeleteObject(compositionBitmap_);
-        }
-        compositionMemoryDc_ = nullptr;
-        compositionBitmap_ = nullptr;
-        compositionOldBitmap_ = nullptr;
-        compositionBits_ = nullptr;
-        compositionDibWidth_ = 0;
-        compositionDibHeight_ = 0;
-    }
-
-    void ReleaseCompositionBackend() {
-        ReleaseCompositionDib();
-        if (compositionVisual3_ != nullptr) compositionVisual3_->Release();
-        if (compositionVisual_ != nullptr) compositionVisual_->Release();
-        if (compositionTarget_ != nullptr) compositionTarget_->Release();
-        if (compositionDevice_ != nullptr) compositionDevice_->Release();
-        if (compositionSwapChain_ != nullptr) compositionSwapChain_->Release();
-        if (d3dContext_ != nullptr) d3dContext_->Release();
-        if (d3dDevice_ != nullptr) d3dDevice_->Release();
-        compositionVisual3_ = nullptr;
-        compositionVisual_ = nullptr;
-        compositionTarget_ = nullptr;
-        compositionDevice_ = nullptr;
-        compositionSwapChain_ = nullptr;
-        d3dContext_ = nullptr;
-        d3dDevice_ = nullptr;
-        compositionWidth_ = 0;
-        compositionHeight_ = 0;
-        compositionActive_ = false;
-    }
-
-    bool InitializeCompositionBackend() {
-        ReleaseCompositionBackend();
-
-        UINT deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-        D3D_FEATURE_LEVEL featureLevel{};
-        HRESULT result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, deviceFlags,
-                                           nullptr, 0U, D3D11_SDK_VERSION, &d3dDevice_,
-                                           &featureLevel, &d3dContext_);
-        // A software WARP surface cannot exercise the hardware-overlay/MPO
-        // path this backend exists for. Fall back to the proven layered HWND
-        // instead when the hardware D3D device is unavailable.
-        if (FAILED(result) || d3dDevice_ == nullptr || d3dContext_ == nullptr) {
-            ReleaseCompositionBackend();
-            return false;
-        }
-
-        IDXGIDevice* dxgiDevice = nullptr;
-        IDXGIAdapter* adapter = nullptr;
-        IDXGIFactory2* factory = nullptr;
-        result = d3dDevice_->QueryInterface(__uuidof(IDXGIDevice),
-                                             reinterpret_cast<void**>(&dxgiDevice));
-        if (SUCCEEDED(result)) result = dxgiDevice->GetAdapter(&adapter);
-        if (SUCCEEDED(result)) {
-            result = adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory));
-        }
-
-        DXGI_SWAP_CHAIN_DESC1 description{};
-        description.Width = 1U;
-        description.Height = 1U;
-        description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        description.Stereo = FALSE;
-        description.SampleDesc.Count = 1U;
-        description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        description.BufferCount = 2U;
-        description.Scaling = DXGI_SCALING_STRETCH;
-        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        // A fully opaque composition surface is substantially more likely to
-        // receive an MPO plane on the Legion Go AMD driver than per-pixel alpha.
-        description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        if (SUCCEEDED(result)) {
-            result = factory->CreateSwapChainForComposition(d3dDevice_, &description, nullptr,
-                                                             &compositionSwapChain_);
-        }
-        if (SUCCEEDED(result)) {
-            result = DCompositionCreateDevice(dxgiDevice, __uuidof(IDCompositionDevice),
-                                               reinterpret_cast<void**>(&compositionDevice_));
-        }
-        if (SUCCEEDED(result)) result = compositionDevice_->CreateTargetForHwnd(window_, TRUE, &compositionTarget_);
-        if (SUCCEEDED(result)) result = compositionDevice_->CreateVisual(&compositionVisual_);
-        if (SUCCEEDED(result)) {
-            result = compositionVisual_->QueryInterface(__uuidof(IDCompositionVisual3),
-                                                        reinterpret_cast<void**>(&compositionVisual3_));
-        }
-        if (SUCCEEDED(result)) result = compositionVisual_->SetContent(compositionSwapChain_);
-        if (SUCCEEDED(result)) result = compositionTarget_->SetRoot(compositionVisual_);
-        if (SUCCEEDED(result)) result = compositionDevice_->Commit();
-
-        if (factory != nullptr) factory->Release();
-        if (adapter != nullptr) adapter->Release();
-        if (dxgiDevice != nullptr) dxgiDevice->Release();
-        if (FAILED(result)) {
-            ReleaseCompositionBackend();
-            return false;
-        }
-        compositionWidth_ = 1;
-        compositionHeight_ = 1;
-        return true;
-    }
-
-    void EnableLayeredFallback() {
-        ReleaseCompositionBackend();
-        if (window_ == nullptr) return;
-        Config config{};
-        {
-            std::lock_guard<std::mutex> lock(configMutex_);
-            config = config_;
-        }
-        const BYTE alpha = static_cast<BYTE>((config.opacityPercent * 255 + 50) / 100);
-        constexpr LONG_PTR layeredStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
-                                          WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-        LONG_PTR style = GetWindowLongPtrW(window_, GWL_EXSTYLE);
-        style = (style & ~static_cast<LONG_PTR>(WS_EX_NOREDIRECTIONBITMAP)) | layeredStyle;
-        SetLastError(ERROR_SUCCESS);
-        const LONG_PTR previousStyle = SetWindowLongPtrW(window_, GWL_EXSTYLE, style);
-        const bool styleChanged = previousStyle != 0 || GetLastError() == ERROR_SUCCESS;
-        const LONG_PTR appliedStyle = GetWindowLongPtrW(window_, GWL_EXSTYLE);
-        const bool converted = styleChanged && (appliedStyle & WS_EX_LAYERED) != 0 &&
-            (appliedStyle & WS_EX_NOREDIRECTIONBITMAP) == 0 &&
-            SetWindowPos(window_, nullptr, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-                         SWP_FRAMECHANGED) != FALSE &&
-            SetLayeredWindowAttributes(window_, 0U, alpha, LWA_ALPHA) != FALSE;
-        if (converted) return;
-
-        // Style conversion is normally supported, but do not leave a blank
-        // no-redirection HWND if a driver/window-manager rejects it.  Create a
-        // fresh original-style window and move the hotkey registration across.
-        const HWND oldWindow = window_;
-        const bool wasShown = IsWindowVisible(oldWindow) != FALSE;
-        HWND replacement = CreateWindowExW(static_cast<DWORD>(layeredStyle), kWindowClass,
-                                            L"Legion Go Telemetry", WS_POPUP, 0, 0, 1, 1,
-                                            nullptr, nullptr, instance_, this);
-        if (replacement == nullptr) return;
-
-        const bool hadHotKey = hotKeyRegistered_;
-        if (hadHotKey) {
-            UnregisterHotKey(oldWindow, activeHotKeyId_);
-            hotKeyRegistered_ = RegisterHotKey(replacement, activeHotKeyId_, MOD_NOREPEAT,
-                static_cast<UINT>(VK_F1 + activeFunctionKey_ - 1)) != FALSE;
-        }
-        window_ = replacement;
-        SetLayeredWindowAttributes(window_, 0U, alpha, LWA_ALPHA);
-        DestroyWindow(oldWindow);
-        refreshMessagePending_.store(false);
-        if (wasShown) {
-            ShowWindow(window_, SW_SHOWNOACTIVATE);
-            PostMessageW(window_, kMessageRefresh, 0U, 0);
-        }
-        if (hadHotKey && !hotKeyRegistered_) activeFunctionKey_ = 0;
-    }
-
-    bool EnsureCompositionSurface(int width, int height) {
-        if (width <= 0 || height <= 0 || compositionSwapChain_ == nullptr) return false;
-        if (width != compositionWidth_ || height != compositionHeight_) {
-            const HRESULT resized = compositionSwapChain_->ResizeBuffers(2U, static_cast<UINT>(width),
-                                                                          static_cast<UINT>(height),
-                                                                          DXGI_FORMAT_UNKNOWN, 0U);
-            if (FAILED(resized)) return false;
-            compositionWidth_ = width;
-            compositionHeight_ = height;
-        }
-        if (compositionMemoryDc_ != nullptr && width == compositionDibWidth_ && height == compositionDibHeight_) {
-            return true;
-        }
-
-        ReleaseCompositionDib();
-        BITMAPINFO information{};
-        information.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        information.bmiHeader.biWidth = width;
-        information.bmiHeader.biHeight = -height; // top-down BGRA pixels
-        information.bmiHeader.biPlanes = 1U;
-        information.bmiHeader.biBitCount = 32U;
-        information.bmiHeader.biCompression = BI_RGB;
-        compositionBitmap_ = CreateDIBSection(nullptr, &information, DIB_RGB_COLORS,
-                                               &compositionBits_, nullptr, 0U);
-        compositionMemoryDc_ = CreateCompatibleDC(nullptr);
-        if (compositionBitmap_ == nullptr || compositionMemoryDc_ == nullptr || compositionBits_ == nullptr) {
-            ReleaseCompositionDib();
-            return false;
-        }
-        compositionOldBitmap_ = SelectObject(compositionMemoryDc_, compositionBitmap_);
-        if (compositionOldBitmap_ == nullptr || compositionOldBitmap_ == HGDI_ERROR) {
-            ReleaseCompositionDib();
-            return false;
-        }
-        compositionDibWidth_ = width;
-        compositionDibHeight_ = height;
-        return true;
-    }
-
-    bool RenderCompositionFrameOnce() {
-        if (!compositionActive_ || window_ == nullptr || d3dContext_ == nullptr) return false;
-        RECT client{};
-        if (GetClientRect(window_, &client) == FALSE) return false;
-        const int width = client.right - client.left;
-        const int height = client.bottom - client.top;
-        if (!EnsureCompositionSurface(width, height)) return false;
-
-        std::memset(compositionBits_, 0, static_cast<std::size_t>(width) *
-                                           static_cast<std::size_t>(height) * 4U);
-        DrawLayout(compositionMemoryDc_, width, height);
-        GdiFlush();
-
-        // DXGI_ALPHA_MODE_IGNORE makes the complete compact rectangle opaque.
-        // Keep alpha initialized as well so captures/debuggers see valid BGRA.
-        auto* pixels = static_cast<std::uint32_t*>(compositionBits_);
-        const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-        for (std::size_t index = 0U; index < pixelCount; ++index) {
-            pixels[index] |= 0xff000000U;
-        }
-
-        ID3D11Texture2D* backBuffer = nullptr;
-        HRESULT result = compositionSwapChain_->GetBuffer(0U, __uuidof(ID3D11Texture2D),
-                                                           reinterpret_cast<void**>(&backBuffer));
-        if (SUCCEEDED(result)) {
-            d3dContext_->UpdateSubresource(backBuffer, 0U, nullptr, compositionBits_,
-                                           static_cast<UINT>(width * 4), 0U);
-            backBuffer->Release();
-            result = compositionSwapChain_->Present(0U, 0U);
-        }
-        return SUCCEEDED(result);
-    }
-
-    void RequestFrame() {
-        if (window_ == nullptr || !visible_.load()) return;
-        if (!compositionActive_) {
-            InvalidateRect(window_, nullptr, FALSE);
-            return;
-        }
-        if (RenderCompositionFrameOnce()) return;
-
-        // A resize/device-removal failure gets one complete recreation.  If
-        // that also fails, convert this same HWND to the proven layered path.
-        ReleaseCompositionBackend();
-        compositionActive_ = InitializeCompositionBackend();
-        if (compositionActive_) {
-            const HRESULT opacityResult = compositionVisual3_->SetOpacity(1.0f);
-            if (SUCCEEDED(opacityResult) && SUCCEEDED(compositionDevice_->Commit()) &&
-                RenderCompositionFrameOnce()) return;
-        }
-        EnableLayeredFallback();
-        UpdateWindowLayout();
-        InvalidateRect(window_, nullptr, FALSE);
     }
 
     static std::wstring FormatNumber(const NumericMetric& metric, const wchar_t* format) {
@@ -1131,20 +843,6 @@ private:
         if (background != nullptr) {
             DeleteObject(background);
         }
-        DrawLayout(targetDc, width, height);
-
-        if (bufferDc != nullptr && bitmap != nullptr) {
-            BitBlt(windowDc, 0, 0, width, height, bufferDc, 0, 0, SRCCOPY);
-            SelectObject(bufferDc, oldBitmap);
-            DeleteObject(bitmap);
-        }
-        if (bufferDc != nullptr) {
-            DeleteDC(bufferDc);
-        }
-        EndPaint(window, &paint);
-    }
-
-    void DrawLayout(HDC targetDc, int width, int height) {
         SetBkMode(targetDc, TRANSPARENT);
 
         Snapshot snapshot{};
@@ -1159,16 +857,17 @@ private:
         }
 
         const double scale = currentScale_;
-        const bool compactCompositionBar = compositionActive_ && config.layoutStyle == 1;
-        const bool fallbackLowResolution = !compositionActive_ && config.layoutStyle == 1 && width < 1600;
-        const double topBarFitScale = fallbackLowResolution ? 1.60 : static_cast<double>(width) / 1120.0;
-        const double minimumBarScale = compactCompositionBar ? 1.0 : 0.75;
+        RECT physicalWindow{};
+        GetWindowRect(window, &physicalWindow);
+        const int physicalWidth = (std::max)(1, static_cast<int>(physicalWindow.right - physicalWindow.left));
+        const bool lowResolutionMode = config.layoutStyle == 1 && physicalWidth < 1600;
+        const double topBarFitScale = lowResolutionMode ? 1.60 : static_cast<double>(width) / 1120.0;
         const double textScale = config.layoutStyle == 1 ?
-            (std::min)(scale, (std::max)(minimumBarScale, topBarFitScale)) : scale;
+            (std::min)(scale, (std::max)(0.75, topBarFitScale)) : scale;
         const int fontHeight = (std::max)(8, static_cast<int>(std::lround(15.0 * textScale)));
         HFONT font = CreateFontW(-fontHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                 ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
         HGDIOBJ oldFont = nullptr;
         if (font != nullptr) {
             oldFont = SelectObject(targetDc, font);
@@ -1197,19 +896,16 @@ private:
             const COLORREF green = RGB(91, 220, 112);
             const COLORREF cyan = RGB(62, 215, 255);
             const COLORREF white = RGB(242, 246, 250);
-            const double paddingBase = compactCompositionBar ? 6.0 : 8.0;
-            const double gapBase = compactCompositionBar ? 4.0 : 10.0;
-            const int requestedPadding = (std::max)(3, static_cast<int>(std::lround(paddingBase * textScale)));
+            const int requestedPadding = (std::max)(3, static_cast<int>(std::lround(8.0 * textScale)));
             const int padding = (std::min)(requestedPadding, (std::max)(0, (width - 1) / 2));
-            const int gap = (std::max)(compactCompositionBar ? 2 : 4,
-                                       static_cast<int>(std::lround(gapBase * textScale)));
-            const int layoutWidth = width;
-            const int layoutHeight = height;
+            const int gap = (std::max)(4, static_cast<int>(std::lround(10.0 * textScale)));
+            const int layoutWidth = lowResolutionMode ? physicalWidth : width;
+            const int layoutHeight = lowResolutionMode ?
+                (std::max)(1, static_cast<int>(std::lround(static_cast<double>(height) * layoutWidth /
+                                                          static_cast<double>((std::max)(1, width))))) : height;
             const int usableWidth = (std::max)(1, layoutWidth - (2 * padding));
             RECT segments[7]{};
-            const int compactWeights[7]{11, 22, 21, 14, 12, 11, 9};
-            const int originalWeights[7]{13, 20, 21, 15, 12, 10, 9};
-            const int* weights = compactCompositionBar ? compactWeights : originalWeights;
+            const int weights[7]{13, 20, 21, 15, 12, 10, 9};
             int segmentLeft = padding, accumulatedWeight = 0;
             for (int index = 0; index < 7; ++index) {
                 accumulatedWeight += weights[index];
@@ -1261,26 +957,24 @@ private:
             DrawTextW(targetDc, fpsValue.c_str(), -1, &fpsValueRect,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-            const wchar_t* separator = compactCompositionBar ? L" " : L"  ";
-            const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + separator +
-                (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + separator +
+            const std::wstring cpuValue = FormatNumber(snapshot.cpuPercent, L"%.0f%%") + L"  " +
+                (snapshot.firmwareKnown ? std::to_wstring(snapshot.temperatureC) + L"C" : L"N/A") + L"  " +
                 FormatNumber(snapshot.powerWatts, L"%.1fW");
             const NumericMetric& vramTotal = snapshot.vramCapacityBytes.known ?
                 snapshot.vramCapacityBytes : snapshot.vramBudgetBytes;
-            const auto memoryForBar = [compactCompositionBar, fallbackLowResolution](
-                const NumericMetric& used, const NumericMetric& total) {
-                if (!compactCompositionBar && !fallbackLowResolution) return FormatCompactMemory(used, total);
+            const auto compactMemoryForWidth = [lowResolutionMode](const NumericMetric& used, const NumericMetric& total) {
+                if (!lowResolutionMode) return FormatCompactMemory(used, total);
                 if (!used.known || !total.known || used.value < 0.0 || total.value <= 0.0) return std::wstring(L"N/A");
                 wchar_t buffer[64]{};
                 return swprintf_s(buffer, L"%.1f/%.1fG", used.value / kBytesPerGiB,
                                   total.value / kBytesPerGiB) >= 0 ? std::wstring(buffer) : std::wstring(L"N/A");
             };
-            const std::wstring gpuValue = FormatNumber(snapshot.gpuPercent, L"%.0f%%") + separator +
-                                          memoryForBar(snapshot.vramUsedBytes, vramTotal);
+            const std::wstring gpuValue = FormatNumber(snapshot.gpuPercent, L"%.0f%%") + L"  " +
+                                          compactMemoryForWidth(snapshot.vramUsedBytes, vramTotal);
             drawPair(segments[1], L"Z1E", orange, cpuValue);
             drawPair(segments[2], L"780M", green, gpuValue);
             drawPair(segments[3], L"RAM", cyan,
-                     memoryForBar(snapshot.ramUsedBytes, snapshot.ramTotalBytes));
+                     compactMemoryForWidth(snapshot.ramUsedBytes, snapshot.ramTotalBytes));
             drawPair(segments[4], L"FAN", orange,
                      snapshot.firmwareKnown ? std::to_wstring(snapshot.fanRpm) + L"RPM" : L"N/A");
             drawPair(segments[5], L"BATT", green, battery);
@@ -1332,6 +1026,15 @@ private:
         if (font != nullptr) {
             DeleteObject(font);
         }
+        if (bufferDc != nullptr && bitmap != nullptr) {
+            BitBlt(windowDc, 0, 0, width, height, bufferDc, 0, 0, SRCCOPY);
+            SelectObject(bufferDc, oldBitmap);
+            DeleteObject(bitmap);
+        }
+        if (bufferDc != nullptr) {
+            DeleteDC(bufferDc);
+        }
+        EndPaint(window, &paint);
     }
 
     static NumericMetric ReadCpuUsage(ULARGE_INTEGER& previousIdle, ULARGE_INTEGER& previousKernel,
@@ -1535,10 +1238,8 @@ private:
             snapshot_ = std::move(snapshot);
         }
         const HWND window = window_;
-        if (window != nullptr && !refreshMessagePending_.exchange(true)) {
-            if (PostMessageW(window, kMessageRefresh, 0U, 0) == FALSE) {
-                refreshMessagePending_.store(false);
-            }
+        if (window != nullptr) {
+            PostMessageW(window, kMessageRefresh, 0U, 0);
         }
     }
 
@@ -1551,8 +1252,6 @@ private:
         ULARGE_INTEGER previousUser{};
         bool havePreviousCpu = false;
         bool telemetryOpen = false;
-        bool pdhOpen = false;
-        bool detailedSensorsRequested = false;
         bool wasVisible = false;
         SteadyClock::time_point nextMetric = SteadyClock::now();
         SteadyClock::time_point nextPresentTraceStart = SteadyClock::now();
@@ -1566,11 +1265,9 @@ private:
             // Hiding the window must never restart ETW or discard frame data.
             const SteadyClock::time_point now = SteadyClock::now();
             bool fpsCaptureEnabled = true;
-            bool detailedSensorsEnabled = false;
             {
                 std::lock_guard<std::mutex> lock(configMutex_);
                 fpsCaptureEnabled = config_.fpsCaptureEnabled;
-                detailedSensorsEnabled = config_.detailedSensorsEnabled;
             }
             DWORD observedForegroundProcess = 0U;
             const HWND observedForegroundWindow = GetForegroundWindow();
@@ -1593,8 +1290,6 @@ private:
             if (!visible) {
                 if (wasVisible) {
                     pdh.Close();
-                    pdhOpen = false;
-                    detailedSensorsRequested = false;
                     dxgi.Close();
                     telemetryOpen = false;
                     havePreviousCpu = false;
@@ -1608,22 +1303,17 @@ private:
             }
 
             if (!wasVisible) {
+                pdh.Open();
                 dxgi.Open();
                 telemetryOpen = true;
-                detailedSensorsRequested = detailedSensorsEnabled;
-                pdhOpen = detailedSensorsEnabled && pdh.Open();
                 nextMetric = now;
                 wasVisible = true;
-            } else if (detailedSensorsEnabled != detailedSensorsRequested) {
-                pdh.Close();
-                detailedSensorsRequested = detailedSensorsEnabled;
-                pdhOpen = detailedSensorsEnabled && pdh.Open();
             }
 
             if (telemetryOpen && now >= nextMetric) {
                 Snapshot snapshot{};
                 snapshot.cpuPercent = ReadCpuUsage(previousIdle, previousKernel, previousUser, havePreviousCpu);
-                if (pdhOpen) pdh.Collect(snapshot.gpuPercent, snapshot.vramUsedBytes, snapshot.powerWatts);
+                pdh.Collect(snapshot.gpuPercent, snapshot.vramUsedBytes, snapshot.powerWatts);
                 dxgi.ReadCapacity(snapshot.vramCapacityBytes, snapshot.vramBudgetBytes);
                 ReadMemory(snapshot);
                 ReadBattery(snapshot);
@@ -1651,9 +1341,8 @@ private:
     std::atomic<bool> initialized_{false};
     std::atomic<bool> visible_{false};
     std::atomic<DWORD> foregroundProcessId_{0U};
-    std::atomic<bool> refreshMessagePending_{false};
     HINSTANCE instance_ = nullptr;
-    std::atomic<HWND> window_{nullptr};
+    HWND window_ = nullptr;
     ATOM classAtom_ = 0U;
     HANDLE stopEvent_ = nullptr;
     HANDLE wakeEvent_ = nullptr;
@@ -1664,22 +1353,6 @@ private:
     bool hotKeyRegistered_ = false;
     int activeHotKeyId_ = kHotKeyIdA;
     int activeFunctionKey_ = 0;
-    bool compositionActive_ = false;
-    ID3D11Device* d3dDevice_ = nullptr;
-    ID3D11DeviceContext* d3dContext_ = nullptr;
-    IDXGISwapChain1* compositionSwapChain_ = nullptr;
-    IDCompositionDevice* compositionDevice_ = nullptr;
-    IDCompositionTarget* compositionTarget_ = nullptr;
-    IDCompositionVisual* compositionVisual_ = nullptr;
-    IDCompositionVisual3* compositionVisual3_ = nullptr;
-    int compositionWidth_ = 0;
-    int compositionHeight_ = 0;
-    HDC compositionMemoryDc_ = nullptr;
-    HBITMAP compositionBitmap_ = nullptr;
-    HGDIOBJ compositionOldBitmap_ = nullptr;
-    void* compositionBits_ = nullptr;
-    int compositionDibWidth_ = 0;
-    int compositionDibHeight_ = 0;
     double currentScale_ = 1.0;
     int firmwareTemperatureC_ = 0;
     int firmwareRpm_ = 0;

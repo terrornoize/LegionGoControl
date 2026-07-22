@@ -16,7 +16,6 @@ namespace LegionGoOverlay {
 struct Config {
     bool enabledAtStartup = false;
     bool fpsCaptureEnabled = true;
-    bool detailedSensorsEnabled = false;
     int functionKey = 10;
     int scalePercent = 100;
     int opacityPercent = 85;
